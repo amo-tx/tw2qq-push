@@ -69,30 +69,44 @@ def main():
 
         monitor.bot.send_post = fake_send_post
 
-    # 先写心跳：云端应用据此自动让位，避免这一轮双份推送
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
+
+    def release_cloud():
+        """本轮失败时清掉 GHA 心跳，避免云端让位却无人推送。"""
+        try:
+            store.clear_heartbeat()
+            logging.info("已清除 GHA 心跳，云端应用将立即接管轮询")
+        except Exception as e:
+            logging.warning("清除 GHA 心跳失败: %s", e)
+
     try:
-        store.write_heartbeat("gha-" + str(run_id),
-                              {"pushed_total": store.total_seen()})
-        logging.info("GHA 心跳已写入（云端应用将自动让位）")
-    except Exception as e:
-        logging.warning("GHA 心跳写入失败（不影响本轮推送）: %s", e)
+        # 必须先确认 QQ 通道可用再写心跳：凭据失效时不能把云端也拖停
+        ok, info = monitor.bot.get_status()
+        logging.info("QQ 官方通道: %s / %s", ok, info)
+        if not ok:
+            raise RuntimeError("QQ 官方通道不可用: " + str(info))
 
-    ok, info = monitor.bot.get_status()
-    logging.info("QQ 官方通道: %s / %s", ok, info)
-    if not ok:
-        raise RuntimeError("QQ 官方通道不可用: " + str(info))
+        # 再写心跳：云端应用据此自动让位，避免这一轮双份推送
+        try:
+            store.write_heartbeat("gha-" + str(run_id),
+                                  {"pushed_total": store.total_seen()})
+            logging.info("GHA 心跳已写入（云端应用将自动让位）")
+        except Exception as e:
+            logging.warning("GHA 心跳写入失败（不影响本轮推送）: %s", e)
 
-    sent, errors = monitor.check_once()
-    logging.info("本轮完成：推送 %d 条，源错误 %d，云端写入 %d 次，去重总数 %d",
-                 sent, errors, store.writes, store.total_seen())
-    if dry:
-        logging.info("DRY_RUN 本将推送: %s", would_push)
+        sent, errors = monitor.check_once()
+        logging.info("本轮完成：推送 %d 条，源错误 %d，云端写入 %d 次，去重总数 %d",
+                     sent, errors, store.writes, store.total_seen())
+        if dry:
+            logging.info("DRY_RUN 本将推送: %s", would_push)
 
-    # 全部博主都抓失败才判失败；单源异常不阻断。dry-run 不判失败（本机常无代理）
-    if errors >= len(cfg["twitter"]["feeds"]) and not dry:
-        raise RuntimeError("全部博主抓取失败，请检查网络或 X 凭据")
-    return 0
+        # 全部博主都抓失败才判失败；单源异常不阻断。dry-run 不判失败（本机常无代理）
+        if errors >= len(cfg["twitter"]["feeds"]) and not dry:
+            raise RuntimeError("全部博主抓取失败，请检查网络或 X 凭据")
+        return 0
+    except Exception:
+        release_cloud()
+        raise
 
 
 if __name__ == "__main__":

@@ -125,3 +125,19 @@ class CloudStore:
         row.update(extra or {})
         return self._post("service_heartbeat", row, "?on_conflict=id",
                           "resolution=merge-duplicates")
+
+    def clear_heartbeat(self) -> bool:
+        """把 id=2 心跳置为过期：本轮失败时调用，云端 watchdog 立即接管轮询。
+
+        GHA 失败（QQ 凭据失效 / 网络异常）若留下新鲜心跳，云端会持续让位，
+        形成「GHA 挂了、云端也停了」的推送空窗，必须显式释放。
+        """
+        if self.dry_run:
+            return True
+        r = self.sess.patch(
+            f"{self.base}/service_heartbeat?id=eq.2",
+            json={"last_seen": "1970-01-01T00:00:00+00:00"},
+            headers={"Prefer": "return=minimal"}, timeout=self.timeout)
+        if r.status_code not in (200, 204):
+            raise RuntimeError(f"清除心跳 HTTP {r.status_code}: {r.text[:160]}")
+        return True
