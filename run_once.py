@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import yaml
@@ -20,6 +21,45 @@ logging.basicConfig(level=logging.INFO,
 
 REQUIRED_SECRETS = ("X_AUTH_TOKEN", "QQ_APP_ID", "QQ_APP_SECRET",
                     "CLOUD_PUBLISHABLE_KEY")
+
+CLOUD_APP = os.environ.get("TW2QQ_CLOUD_APP",
+                           "https://tw2qq-pusher.app.workbuddy.host")
+SHARECODE = os.environ.get("TW2QQ_SHARECODE", "Z3YR5C5DTB")
+
+
+def wake_cloud() -> dict:
+    """GHA 直连 X 被限流时，唤醒云端应用并让它代跑本轮。
+
+    云端走代理，X 通道正常；访问 /api/health 本身也能唤回被平台回收的 sandbox，
+    因此这一步同时承担「外部看门狗」职责。任何异常只记录、不抛出。
+    """
+    import requests
+    s = requests.Session()
+    s.trust_env = False
+    s.headers.update({"User-Agent": "tw2qq-gha-watchdog/1.0"})
+    q = {"sharecode": SHARECODE}
+    out = {"ok": False, "health": None, "checked": None}
+    for i in range(3):
+        try:
+            r = s.get(CLOUD_APP + "/api/health", params=q, timeout=45)
+            out["health"] = r.status_code
+            if r.status_code == 200:
+                out["ok"] = True
+                break
+        except Exception as e:
+            logging.warning("云端应用唤醒第 %d 次失败: %s", i + 1, e)
+        time.sleep(5)
+    if not out["ok"]:
+        return out
+    # 立刻触发一轮抓取以缩短空窗；该接口同步执行，超时不影响判定
+    try:
+        r = s.post(CLOUD_APP + "/api/check", params=q, timeout=150)
+        out["checked"] = r.status_code
+        if r.status_code == 200:
+            logging.info("云端代跑一轮: %s", str(r.json())[:200])
+    except Exception as e:
+        logging.warning("云端代跑触发失败（云端轮询线程仍会自行抓取）: %s", e)
+    return out
 
 
 def build_runtime_config():
@@ -100,9 +140,19 @@ def main():
         if dry:
             logging.info("DRY_RUN 本将推送: %s", would_push)
 
-        # 全部博主都抓失败才判失败；单源异常不阻断。dry-run 不判失败（本机常无代理）
+        # 全部博主都抓失败：CI runner 的共享出口 IP 常被 X 限流。
+        # 此时先释放心跳让云端恢复轮询，再唤醒云端代跑，避免「两头都停」。
+        # 只有云端也不可达时才判本轮失败。dry-run 不判失败（本机常无代理）
         if errors >= len(cfg["twitter"]["feeds"]) and not dry:
-            raise RuntimeError("全部博主抓取失败，请检查网络或 X 凭据")
+            release_cloud()
+            cloud = wake_cloud()
+            if cloud["ok"]:
+                logging.warning(
+                    "本轮 GHA 直连 X 全部失败（出口 IP 限流），已交回云端应用推送；"
+                    "health=%s check=%s", cloud["health"], cloud["checked"])
+                return 0
+            raise RuntimeError("全部博主抓取失败，且云端应用不可达（health=%s）"
+                               % cloud["health"])
         return 0
     except Exception:
         release_cloud()
