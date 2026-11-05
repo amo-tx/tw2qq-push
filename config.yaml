@@ -1,0 +1,83 @@
+# GitHub Actions 运行配置：仓库内零明文凭据，全部由 Secrets 注入
+interval_minutes: 10
+poll_seconds: 120
+backfill: false
+backfill_hours: 24
+max_push_age_hours: 2
+max_push_per_cycle: 5
+auto_reconnect: false
+auto_login_qq: false
+send_images: true
+send_videos: true
+max_images: 4
+max_videos: 2
+video_gif_seconds: 10
+translate: true
+db_path: data/seen.db
+network:
+  proxy: ''
+  chromego_kernel: clash.meta
+  chromego_auto_start: false
+  chromego_stop_on_exit: false
+x:
+  auth_token: ''
+twitter:
+  feeds:
+  - name: 潮鳴劇団~ 鳴潮応援部
+    handle: meicyououenbu
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  - name: 낡은창고 oldstore
+    handle: teska1567
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  - name: 手裏剣丸
+    handle: syurikenmaru
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  - name: 모냐미 Monyami
+    handle: monyami_
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  - name: BB
+    handle: BB_33750
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  - name: 아르 Are
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+    handle: Are_A_R
+qq:
+  official:
+    enabled: true
+    app_id: ''
+    client_secret: ''
+    collect_groups: false
+  napcat:
+    base_url: http://127.0.0.1:3000
+    access_token: ''
+    dir: napcat
+    qq: '3961685949'
+  groups:
+  - CB9118494C282130A1B9FFF0A98AED7D
+template: '🐦 {name} (@{author}) 更新推文
+
+  ⏱ {time}
+
+  ────────────────
+
+  {text}
+
+  ────────────────
+
+  🔗 原文：{link}
+
+  '
+translate_engine: llm
+media_cache_days: 3
+media_cache_max_mb: 500
+at_all: false
+cloud:
+  enabled: true
+  endpoint: https://tw2qq-pusher.app.workbuddy.host
+  publishable_key: ''
