@@ -13,10 +13,11 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 
 MENU_TEXT = (
-    "🤖 推送机器人指令（@我 + 指令）\n"
-    "• 菜单 — 本菜单　• 更多 — 全部指令\n"
+    "🤖 推送机器人指令（@我 + 指令，或点下方按钮）\n"
+    "• 菜单 — 本菜单　• 更多 — 全部指令　• 按钮 — 可点击面板\n"
     "• 关注列表 — 列出你 X 账号关注的人\n"
     "• 关注 @handle / 关注 序号 — 加博主\n"
     "• 列表 / 移除 序号 — 管理推送列表\n"
@@ -44,7 +45,8 @@ MORE_TEXT = (
     "【诊断】\n"
     "• 自检 — QQ / X 登录态 / 云库 / 守护\n"
     "• 日志 — 最近 5 条日志 · 检查 — 全量抓取\n"
-    "• 暂停 / 恢复 — 停开自动推送"
+    "• 暂停 / 恢复 — 停开自动推送\n"
+    "• 按钮 / 面板 — 显示可点击的指令按钮（推荐）"
 )
 
 FOLLOWING_PAGE = 12          # 关注列表每页条数（被动回复按 UTF-8 字节限长）
@@ -52,6 +54,144 @@ FOLLOWING_TTL = 600          # 关注列表缓存 10 分钟
 MAX_BATCH = 10               # 单次批量添加上限
 _BOT_REPLY_PREFIXES = ("🤖", "🧰", "👥", "✅", "❌", "🕒", "🔎", "📋", "📡",
                        "当前状态：", "正在检查", "未识别指令")
+
+# ============ 群聊「消息按钮」= QQ 官方机器人 keyboard ============
+# action.type=2 指令按钮：群成员点一下，客户端自动把「@机器人 + data」
+# 填进输入框，用户按发送即可执行，不用手敲中文指令（避免打错 / 全角 / 空格）。
+# 注意：enter=true 的「点击即发」仅单聊可用，群聊必须留 enter=false。
+PANEL_MAIN = [
+    ("列表", "列表"), ("关注列表", "关注列表"), ("检查", "检查"), ("状态", "状态"),
+    ("更多指令", "更多"), ("按钮面板", "按钮"), ("自检", "自检"), ("日志", "日志"),
+]
+PANEL_MORE = [
+    ("列表", "列表"), ("关注列表", "关注列表"), ("关注列表 2", "关注列表 2"), ("刷新关注", "刷新关注"),
+    ("找 关键词", "找 "), ("最新 1", "最新 1"), ("状态", "状态"), ("自检", "自检"),
+    ("批量 1-3", "批量 1-3"), ("回推 1", "回推 1"), ("间隔 60", "间隔 60"), ("间隔 300", "间隔 300"),
+    ("翻译 开", "翻译 开"), ("翻译 关", "翻译 关"), ("图片 开", "图片 开"), ("图片 关", "图片 关"),
+    ("视频 开", "视频 开"), ("视频 关", "视频 关"), ("检查", "检查"), ("更多", "更多"),
+]
+PANEL_COMMON = [
+    ("菜单", "菜单"), ("更多指令", "更多"), ("列表", "列表"),
+    ("状态", "状态"), ("检查", "检查"), ("按钮面板", "按钮"),
+]
+BUTTON_TEXT = (
+    "⌨️ 点下方按钮，指令会自动填进输入框，按发送即可执行。\n"
+    "带参数的指令也可以先点按钮再补内容（例：点「找 关键词」后输入关键词）。\n"
+    "发「菜单」回主菜单 · 发「更多」看文字版全部指令"
+)
+
+# 控制台「群指令速查」与 /api/commands 共用的一份目录（唯一数据源）
+COMMAND_CATALOG = [
+    {"group": "常用", "items": [
+        {"label": "菜单", "cmd": "菜单", "desc": "主菜单"},
+        {"label": "更多", "cmd": "更多", "desc": "全部指令"},
+        {"label": "按钮面板", "cmd": "按钮", "desc": "在群里显示可点按钮"},
+        {"label": "列表", "cmd": "列表", "desc": "当前推送的博主"},
+        {"label": "关注列表", "cmd": "关注列表", "desc": "X 关注的人（分页）"},
+        {"label": "检查", "cmd": "检查", "desc": "立即抓取并推送"},
+        {"label": "状态", "cmd": "状态", "desc": "运行状态"},
+        {"label": "自检", "cmd": "自检", "desc": "通道 / 登录 / 云库"},
+        {"label": "日志", "cmd": "日志", "desc": "最近 5 条日志"},
+    ]},
+    {"group": "博主", "items": [
+        {"label": "刷新关注", "cmd": "刷新关注", "desc": "重新抓取 X 关注列表"},
+        {"label": "第 2 页", "cmd": "关注列表 2", "desc": "关注列表翻页"},
+        {"label": "找 关键词", "cmd": "找 ", "desc": "搜索（后面补关键词）"},
+        {"label": "关注 序号", "cmd": "关注 ", "desc": "按序号加博主"},
+        {"label": "批量 1-5", "cmd": "批量 1-5", "desc": "一次加多位"},
+        {"label": "移除 1", "cmd": "移除 1", "desc": "停止推送（不取关）"},
+        {"label": "回推 1", "cmd": "回推 1", "desc": "补发近 24 小时"},
+        {"label": "最新 1", "cmd": "最新 1", "desc": "预览最近 3 条"},
+    ]},
+    {"group": "开关与配置", "items": [
+        {"label": "间隔 60", "cmd": "间隔 60", "desc": "抓取间隔 60 秒"},
+        {"label": "翻译 开", "cmd": "翻译 开", "desc": "开启自动翻译"},
+        {"label": "翻译 关", "cmd": "翻译 关", "desc": "关闭自动翻译"},
+        {"label": "图片 开", "cmd": "图片 开", "desc": "推送配图"},
+        {"label": "图片 关", "cmd": "图片 关", "desc": "不推配图"},
+        {"label": "视频 开", "cmd": "视频 开", "desc": "推送 GIF"},
+        {"label": "视频 关", "cmd": "视频 关", "desc": "不推 GIF"},
+        {"label": "暂停", "cmd": "暂停", "desc": "停止自动推送"},
+        {"label": "恢复", "cmd": "恢复", "desc": "恢复自动推送"},
+    ]},
+]
+
+_MENU_ALIASES = ("菜单", "help", "菜单帮助", "帮助", "指令", "功能", "功能列表",
+                 "?", "？", "0", "menu", "commands")
+_MORE_ALIASES = ("更多", "全部指令", "高级", "进阶", "more", "更多功能", "所有功能",
+                 "全部功能", "指令大全", "按钮", "面板", "控制台", "快捷指令",
+                 "buttons", "button")
+_PANEL_ALIASES = ("按钮", "面板", "控制台", "快捷指令", "buttons", "button")
+_BOT_REPLY_PREFIXES += ("⌨️",)
+
+
+def normalize_command(raw) -> str:
+    """把群里发来的内容归一化成纯指令文本。
+
+    处理：官方 <@!openid> 标记、CQ 码、全角字符（NFKC）、QQ 的特殊空格、
+    首尾的 @ / 斜杠 / 标点、连续空白。菜单发现类指令经常「失败」多数是
+    因为全角标点或特殊空格混进了指令，这里一次性消掉。
+    """
+    s = unicodedata.normalize("NFKC", str(raw or ""))
+    s = re.sub(r"<@!?[^>]*>", " ", s)
+    s = re.sub(r"\[CQ:at[^\]]*\]", " ", s)
+    for ch in ("\u2005", "\xa0", "\u3000", "\u200b", "\ufeff"):
+        s = s.replace(ch, " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    # 部分客户端把 @ 机器人渲染成纯文本「@机器人名称 指令」，只剥离机器人名，
+    # 不碰「@全体 开」这类真实指令。
+    s = re.sub(r"^@(?:机器人|bot|助手|小助手|qq机器人|推特机器人|twitter2qq)"
+               r"[^\s]{0,12}\s+", "", s, flags=re.I)
+    s = re.sub(r"^[\s@/\\#.,:：;!?？~～\-—_、，。！·]+", "", s)
+    s = re.sub(r"[\s.,:：;!?？~～、，。！·]+$", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _kw(word: str) -> str:
+    """生成允许字间插空格的正则片段：「关注列表」→「关\\s*注\\s*列\\s*表」。"""
+    return r"\s*".join(re.escape(ch) for ch in word)
+
+
+def make_keyboard(items, per_row: int = 4) -> dict:
+    """把 (按钮文字, 填入输入框的指令) 列表编成 QQ keyboard 载荷。
+
+    平台限制：最多 5 行、每行最多 5 个按钮，label ≤10 字符。
+    """
+    rows, row, idx = [], [], 0
+    for label, data in items:
+        if len(row) >= per_row:
+            rows.append({"buttons": row})
+            row = []
+        row.append({
+            "id": "b%d" % idx,
+            "render_data": {
+                "label": str(label)[:10],
+                "visited_label": "已选择",
+                "style": 1 if idx < per_row else 0,
+            },
+            "action": {
+                "type": 2,                       # 2 = 指令按钮
+                "permission": {"type": 2},       # 所有人可点
+                "data": str(data),
+                "enter": False,                 # 群聊只能填入输入框，不能自动发送
+                "unsupport_tips": "请手动 @机器人 发送：" + str(data),
+            },
+        })
+        idx += 1
+    if row:
+        rows.append({"buttons": row})
+    return {"content": {"rows": rows[:5]}}
+
+
+def panel_keyboard(name: str = "main") -> dict:
+    panels = {"main": PANEL_MAIN, "more": PANEL_MORE, "common": PANEL_COMMON}
+    return make_keyboard(panels.get(name, PANEL_COMMON))
+
+
+def official_keyboard_state(monitor) -> dict:
+    bot = getattr(monitor, "bot", None)
+    fn = getattr(bot, "keyboard_state", None)
+    return fn() if callable(fn) else {"supported": False, "mode": "unavailable"}
 
 
 class CommandHandler:
@@ -137,7 +277,7 @@ class CommandHandler:
     # ---------- 指令分发（两条通道共用） ----------
     def _dispatch(self, cmd: str, ctx: dict = None) -> str:
         ctx = ctx or {}
-        raw = (cmd or "").strip().lstrip("/＠@").strip()
+        raw = normalize_command(cmd)
         c = re.sub(r"\s+", "", raw).lower()
         try:
             return self._dispatch_inner(raw, c, ctx) or ""
@@ -147,14 +287,16 @@ class CommandHandler:
 
     def _dispatch_inner(self, raw: str, c: str, ctx: dict) -> str:
         # ---- 无参指令 ----
-        if not c or c in ("菜单", "help", "菜单帮助", "帮助", "指令"):
+        if not c or c in _MENU_ALIASES:
             return MENU_TEXT
-        if c in ("更多", "全部指令", "高级", "进阶", "more"):
+        if c in _PANEL_ALIASES:
+            return BUTTON_TEXT
+        if c in _MORE_ALIASES:
             return MORE_TEXT
         if c in ("检查", "立即检查", "刷新", "更新"):
             threading.Thread(target=self._do_check, daemon=True).start()
             return "📡 正在检查所有博主的新推文，有更新会直接推送到群…"
-        if c in ("状态", "status"):
+        if c in ("状态", "status", "运行情况"):
             return self._status_text()
         if c in ("列表", "博主", "推送列表", "我的博主"):
             return self._cmd_feeds()
@@ -173,6 +315,9 @@ class CommandHandler:
             self.monitor.manual_pause = False
             self.monitor.start()
             return "▶️ 已恢复自动推送。"
+        if c in ("下一页", "下页", "next", "上一页", "上页", "prev"):
+            step = 1 if c in ("下一页", "下页", "next") else -1
+            return self._cmd_following(max(1, getattr(self, "_last_page", 1) + step))
 
         m = re.fullmatch(r"@?全体(开|关)", c)
         if m:
@@ -193,33 +338,40 @@ class CommandHandler:
             self.save_config({"send_videos": on})
             return f"✅ 视频/GIF 已{'开启' if on else '关闭'}。"
 
-        # ---- 带参指令（顺序敏感：长关键词在前） ----
-        m = re.match(r"^(?:关注列表|我关注的|x关注|following)\s*(\d*)\s*$",
-                     raw, re.I)
+        # ---- 带参指令（顺序敏感：长关键词在前；允许中文指令中间夹空格） ----
+        m = re.match(r"^(?:%s|%s|%s|following)\s*(?:第)?\s*(\d*)\s*页?\s*$"
+                     % (_kw("关注列表"), _kw("我关注的"), _kw("x关注")), raw, re.I)
         if m:
             return self._cmd_following(int(m.group(1) or 1))
 
-        m = re.match(r"^(?:批量|批量关注|批量添加|导入)\s*(.+)$", raw, re.I)
+        m = re.match(r"^(?:%s|%s|%s|导入)\s*(.*)$"
+                     % (_kw("批量关注"), _kw("批量添加"), _kw("批量")), raw, re.I)
         if m:
             return self._cmd_batch(m.group(1), ctx)
 
-        m = re.match(r"^(?:关注|添加|加博主|加|\+)\s*(.+)$", raw, re.I)
+        m = re.match(r"^(?:%s|%s|%s|加|\+)\s*(.*)$"
+                     % (_kw("加博主"), _kw("添加"), _kw("关注")), raw, re.I)
         if m:
             return self._cmd_add(m.group(1), ctx)
 
-        m = re.match(r"^(?:移除|删除|删|取关|取消关注|-)\s*(.+)$", raw, re.I)
+        m = re.match(r"^(?:%s|%s|%s|%s|删|-)\s*(.*)$"
+                     % (_kw("取消关注"), _kw("移除"), _kw("删除"), _kw("取关")),
+                     raw, re.I)
         if m:
             return self._cmd_remove(m.group(1), ctx)
 
-        m = re.match(r"^(?:找|搜索|搜)\s*(.+)$", raw, re.I)
+        m = re.match(r"^(?:%s|%s|%s)\s*(.*)$"
+                     % (_kw("搜索"), _kw("搜"), _kw("找")), raw, re.I)
         if m:
             return self._cmd_find(m.group(1))
 
-        m = re.match(r"^(?:最新|预览|看看)\s*(.+)$", raw, re.I)
+        m = re.match(r"^(?:%s|%s|%s)\s*(.*)$"
+                     % (_kw("预览"), _kw("看看"), _kw("最新")), raw, re.I)
         if m:
             return self._cmd_latest(m.group(1))
 
-        m = re.match(r"^(?:回推|补发|补推)\s*(.+)$", raw, re.I)
+        m = re.match(r"^(?:%s|%s|%s)\s*(.*)$"
+                     % (_kw("补发"), _kw("补推"), _kw("回推")), raw, re.I)
         if m:
             return self._cmd_backfill(m.group(1), ctx)
 
@@ -231,7 +383,8 @@ class CommandHandler:
             return (f"当前每 {p} 秒抓取一次每个博主；发「间隔 60」修改（30~3600 秒）"
                     if p else f"当前每 {self.monitor.interval // 60} 分钟全量检查一次")
 
-        return f"未识别指令：「{raw}」\n发送「菜单」或「更多」查看支持的指令。"
+        return (f"未识别指令：「{raw}」\n"
+                "点下方按钮即可填入正确指令，或发送「菜单」/「更多」查看。")
 
     # ---------- 通道差异钩子 ----------
     def _set_at_all(self, on: bool) -> str:
@@ -320,6 +473,7 @@ class CommandHandler:
         existing = {self._feed_key(f).lower() for f in self._feeds()}
         pages = max(1, (len(users) + FOLLOWING_PAGE - 1) // FOLLOWING_PAGE)
         page = max(1, min(page, pages))
+        self._last_page = page     # 供「下一页 / 上一页」使用
         chunk = users[(page - 1) * FOLLOWING_PAGE: page * FOLLOWING_PAGE]
         lines = [f"👥 你 X 账号关注 {len(users)} 人（第 {page}/{pages} 页，✅=已推送）"]
         for i, u in enumerate(chunk, (page - 1) * FOLLOWING_PAGE + 1):
@@ -631,16 +785,71 @@ class OfficialCommandHandler(CommandHandler):
         }
         reply = self._dispatch(content, ctx)
         if reply:
-            self._reply(group_openid, msg_id, reply)
+            keyboard = self._keyboard_for(content, reply) if self._buttons_enabled() else None
+            self._reply(group_openid, msg_id, reply, keyboard)
 
     @staticmethod
     def _clean_content(raw: str) -> str:
-        """去掉官方事件 content 里的 @ 标记与各种空白，留下纯指令文本。"""
-        s = re.sub(r"<@!?[^>]*>", " ", raw)        # <@!member_openid>
-        s = re.sub(r"\[CQ:at[^\]]*\]", " ", s)     # 兼容 CQ 码
-        s = s.replace("\u2005", " ").replace("\xa0", " ").replace("\u3000", " ")
-        s = re.sub(r"^[\s@＠/．.、,，:：]+", "", s)
-        return s.strip()
+        """去掉官方事件 content 里的 @ 标记 / 全角字符 / 特殊空格。"""
+        return normalize_command(raw)
+
+    def _buttons_enabled(self) -> bool:
+        """config: qq.official.buttons: false 可临时关闭消息按钮。"""
+        try:
+            cfg = ((self.monitor.config.get("qq") or {}).get("official") or {})
+            return cfg.get("buttons", True) is not False
+        except Exception:
+            return True
+
+    def _keyboard_for(self, content: str, reply: str) -> dict:
+        """按当前指令挑一组按钮，跟着回复一起下发（点按钮＝填好指令）。"""
+        c = re.sub(r"\s+", "", normalize_command(content)).lower()
+        if c in _MENU_ALIASES or not c:
+            return panel_keyboard("main")
+        if c in _MORE_ALIASES:
+            return panel_keyboard("more")
+        if "未识别指令" in reply:
+            return make_keyboard([
+                ("菜单", "菜单"), ("更多指令", "更多"), ("列表", "列表"),
+                ("关注列表", "关注列表"), ("状态", "状态"), ("按钮面板", "按钮"),
+            ])
+
+        # 关注列表：翻页 + 本页前 4 个序号可直接「关注 / 批量」
+        m = re.search(r"第\s*(\d+)\s*/\s*(\d+)\s*页", reply)
+        if m:
+            page, pages = int(m.group(1)), int(m.group(2))
+            start = (page - 1) * FOLLOWING_PAGE + 1
+            items = []
+            if page > 1:
+                items.append(("上一页", f"关注列表 {page - 1}"))
+            if page < pages:
+                items.append(("下一页", f"关注列表 {page + 1}"))
+            items += [("刷新关注", "刷新关注"), ("列表", "列表")]
+            items += [(f"关注 {n}", f"关注 {n}") for n in range(start, start + 4)]
+            items += [(f"批量 {start}-{start + 2}", f"批量 {start}-{start + 2}"),
+                      ("菜单", "菜单"), ("更多指令", "更多"), ("检查", "检查")]
+            return make_keyboard(items)
+
+        # 「找」结果：把前 3 个序号做成一键关注
+        if reply.startswith("🔍"):
+            nums = [int(x) for x in
+                    re.findall(r"^\s*(\d+)\.\s*[✅　]", reply, re.M)][:3]
+            items = [(f"关注 {n}", f"关注 {n}") for n in nums]
+            items += [("关注列表", "关注列表"), ("刷新关注", "刷新关注"),
+                      ("列表", "列表"), ("菜单", "菜单")]
+            return make_keyboard(items)
+
+        # 推送列表：前 3 位可一键回推 / 预览
+        if reply.startswith("📋"):
+            m2 = re.search(r"当前推送\s*(\d+)\s*位", reply)
+            n = min(int(m2.group(1)) if m2 else 0, 3)
+            items = [(f"回推 {i}", f"回推 {i}") for i in range(1, n + 1)]
+            items += [(f"最新 {i}", f"最新 {i}") for i in range(1, n + 1)]
+            items += [("关注列表", "关注列表"), ("刷新关注", "刷新关注"),
+                      ("检查", "检查"), ("更多指令", "更多")]
+            return make_keyboard(items)
+
+        return panel_keyboard("common")
 
     def _set_at_all(self, on: bool) -> str:
         return "QQ 官方机器人不支持 @全体成员（平台限制），该设置未修改。"
@@ -652,11 +861,12 @@ class OfficialCommandHandler(CommandHandler):
         except Exception as e:
             return "未知（%s）" % type(e).__name__
 
-    def _reply(self, group_openid: str, msg_id: str, text: str):
+    def _reply(self, group_openid: str, msg_id: str, text: str, keyboard=None):
         try:
             if msg_id:
                 try:
-                    self.bot.reply_group_msg(group_openid, msg_id, text)
+                    self.bot.reply_group_msg(group_openid, msg_id, text,
+                                             keyboard=keyboard)
                     self.replies += 1
                     self.last_reply = time.strftime("%Y-%m-%d %H:%M:%S")
                     return
@@ -664,7 +874,8 @@ class OfficialCommandHandler(CommandHandler):
                     self.last_error = str(e)[:120]
                     logging.warning("被动回复失败，回退主动消息: %s", e)
             self.bot.send_group_msg(group_openid,
-                                    [{"type": "text", "data": {"text": text}}])
+                                    [{"type": "text", "data": {"text": text}}],
+                                    keyboard=keyboard)
             self.replies += 1
             self.last_reply = time.strftime("%Y-%m-%d %H:%M:%S")
         except Exception as e:
@@ -679,6 +890,7 @@ class OfficialCommandHandler(CommandHandler):
             "last_event": self.last_event,
             "last_reply": self.last_reply,
             "last_error": self.last_error,
+            "buttons": official_keyboard_state(self.monitor),
         }
 
 

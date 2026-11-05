@@ -6,6 +6,7 @@
   代理走系统全局 VPN（Clash for Android 等），ffmpeg 用 Termux 的 pkg 版
 """
 import os
+import shutil
 import sys
 
 IS_WINDOWS = sys.platform == "win32"
@@ -29,14 +30,19 @@ EXTERNAL_NAPCAT = IS_ANDROID or IS_LINUX  # NapCat 不由本程序拉起，仅�
 
 
 def ffmpeg_exe() -> str:
-    """ffmpeg 可执行文件：Windows 用打包内置的 imageio_ffmpeg，其他平台用系统 PATH"""
-    if IS_WINDOWS:
-        try:
-            import imageio_ffmpeg
-            return imageio_ffmpeg.get_ffmpeg_exe()
-        except Exception:
-            pass
+    """ffmpeg 可执行文件：优先 imageio-ffmpeg 自带二进制，再退到系统 PATH。
+
+    云端 Linux 镜像通常没有系统 ffmpeg；旧实现只在 Windows 分支尝试
+    imageio_ffmpeg，Linux 分支还调用了未 import 的 shutil.which，导致云端
+    转 GIF 一律 NameError 失败（表现为「视频/GIF 拉不到」）。这里统一为
+    「自带二进制 → PATH → 兜底名」，三个平台行为一致。
+    """
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe:
+            return exe
+    except Exception:
+        pass
     found = shutil.which("ffmpeg")
-    if found:
-        return found
-    return "ffmpeg"
+    return found or "ffmpeg"
