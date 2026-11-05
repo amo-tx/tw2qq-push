@@ -11,6 +11,7 @@ import json
 import logging
 import time
 import re
+import secrets
 
 import requests
 
@@ -52,6 +53,11 @@ def _session(auth_token: str = "") -> requests.Session:
     s.headers.update(UA)
     if auth_token:
         s.cookies.set("auth_token", auth_token, domain=".x.com")
+    # X 的 GraphQL 要求 x-csrf-token 头与 ct0 cookie 一致（双重提交）。
+    # 部分网络环境下 x.com 不会主动下发 ct0，导致登录态被误判失效；
+    # 这里主动生成一枚，服务端只比对两者是否相同，不校验来源。
+    if not s.cookies.get("ct0"):
+        s.cookies.set("ct0", secrets.token_hex(16), domain=".x.com")
     return s
 
 
@@ -130,7 +136,22 @@ def _authed_context(auth_token: str, force: bool = False) -> tuple:
         except Exception:
             pass
     if not uid:
-        raise RuntimeError("无法获取当前账号 user id（登录态可能已失效），请重新配置 auth_token")
+        # 登录态页面里通常还嵌着当前用户 id，再从 HTML 兜一次
+        for pat in (r'"id_str"\s*:\s*"(\d{5,})"',
+                    r'data-user-id="(\d{5,})"',
+                    r'"rest_id"\s*:\s*"(\d{5,})"'):
+            m = re.search(pat, r.text or "")
+            if m:
+                uid = m.group(1)
+                break
+    if not uid:
+        # 关键：GraphQL UserTweets 只需要「目标博主」的 uid，当前账号 uid 并不参与请求。
+        # 共享出口 IP（如 CI runner）常被 verify_credentials 拦截，旧实现在这里直接抛错，
+        # 会把整条登录态主通道废掉、只留下容易被 429 的公开兜底。故降为告警并继续。
+        logging.warning("未取到当前账号 user id（GraphQL 时间线不依赖它，继续）")
+        uid = ""
+    logging.info("X 登录态上下文: bearer=%s ct0=%s uid=%s qids=%s",
+                 bool(bearer), bool(ct0), bool(uid), ",".join(sorted(qids)))
     ctx = (s, bearer, ct0, uid, qids)
     _CTX_CACHE.update(key=key, ts=now, ctx=ctx)
     return ctx
@@ -420,6 +441,8 @@ def fetch_following(auth_token: str, max_pages: int = 5) -> list:
     最多 max_pages 页，约 500 个账号。
     """
     s, bearer, ct0, uid, qids = _authed_context(auth_token)
+    if not uid:
+        raise RuntimeError("无法获取当前账号 user id，读取关注列表需要该值")
     users, seen = [], set()
 
     def _add(sn, name="", avatar=""):
