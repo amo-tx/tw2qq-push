@@ -112,7 +112,8 @@ def _tick(monitor, chromego, cloud, keepalive_url, stall_seconds,
     else:
         if prev:
             _repair("GitHub Actions 超过 15 分钟未运行，云端轮询自动接管")
-        if not monitor.is_running:
+        # 群指令「暂停」是有意行为，守护不得把它当成故障自动拉起
+        if not monitor.is_running and not getattr(monitor, "manual_pause", False):
             try:
                 monitor.start()
             except Exception as e:
@@ -123,7 +124,8 @@ def _tick(monitor, chromego, cloud, keepalive_url, stall_seconds,
     with _lock:
         _state["last_check_age"] = int(age) if age is not None else None
     if (age is not None and age > stall_seconds
-            and not monitor.checking and not gha):
+            and not monitor.checking and not gha
+            and not getattr(monitor, "manual_pause", False)):
         def _catchup():
             try:
                 monitor.check_once()
