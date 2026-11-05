@@ -151,11 +151,19 @@ class OfficialBotClient:
                 return fi
         raise RuntimeError("图片上传失败（二进制与 URL 两种方式均未成功）")
 
+    @staticmethod
+    def _clip(text: str, limit: int = 1000) -> str:
+        """按 UTF-8 字节裁剪（QQ content 限长按字节算，中文 3 字节/字）。"""
+        raw = str(text).encode("utf-8")
+        if len(raw) <= limit:
+            return str(text)
+        return raw[:limit].decode("utf-8", "ignore")
+
     def reply_group_msg(self, group_openid: str, msg_id: str, text: str,
                         msg_seq: int = 1) -> dict:
         """被动回复群内 @ 消息。msg_id 必须来自 GROUP_AT_MESSAGE_CREATE 事件，
         有效期 5 分钟；被动回复不占用主动消息配额。"""
-        payload = {"msg_type": 0, "content": str(text)[:1000],
+        payload = {"msg_type": 0, "content": self._clip(text),
                    "msg_id": str(msg_id), "msg_seq": msg_seq}
         path = f"/v2/groups/{group_openid}/messages"
         try:
@@ -178,7 +186,8 @@ class OfficialBotClient:
         # 1) 文本
         if text:
             results.append(self._api("POST", f"/v2/groups/{group_openid}/messages",
-                                     {"msg_type": 0, "content": text, "msg_seq": 1}))
+                                     {"msg_type": 0, "content": self._clip(text),
+                                      "msg_seq": 1}))
         # 2) 图片：本地下载后 base64 直传（腾讯服务器拉不到 X 图床，需自己下载）
         for img in images:
             url = img[8:] if str(img).startswith("base64://") else str(img)
