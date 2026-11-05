@@ -13,7 +13,7 @@ from core import x_source
 from core import net
 from core.feed import fetch_feed
 from core.formatter import format_message
-from core.media import download_media, video_to_gif
+from core.media import download_media, video_to_gif, hls_url
 from core.qq_bot import OneBotClient
 from core.ssl_setup import enable_system_trust
 from core.store import Store
@@ -247,7 +247,10 @@ class Monitor:
         return fetch_feed(feed_cfg["url"])
 
     def _prepare_videos(self, tweet: dict) -> list:
-        """下载推文视频并逐个转 GIF，返回本地 mp4 路径列表（GIF 存同目录同名）"""
+        """下载视频并转 GIF，返回占位 mp4 路径列表（send_post 只按同名 .gif 取用）。
+
+        兼容 X 只给 HLS(.m3u8) 的视频：交给 ffmpeg 直接读流，不落盘 mp4。
+        """
         max_n = int(self.config.get("max_videos", 2))
         secs = int(self.config.get("video_gif_seconds", 10))
         media_dir = self.base_dir / "data" / "media"
@@ -256,13 +259,23 @@ class Monitor:
         paths = []
         for i, vurl in enumerate(tweet.get("videos", [])[:max_n]):
             dest = media_dir / f"{key}_{i}.mp4"
+            gif = dest.with_suffix(".gif")
             try:
-                download_media(vurl, dest)
-                video_to_gif(dest, dest.with_suffix(".gif"), max_seconds=secs)
+                if hls_url(vurl):
+                    video_to_gif(vurl, gif, max_seconds=secs)
+                else:
+                    download_media(vurl, dest)
+                    video_to_gif(dest, gif, max_seconds=secs)
                 paths.append(dest)
-                logging.info("视频已处理: %s (+GIF)", dest.name)
+                logging.info("视频/GIF 已处理: %s (%.2f MB)",
+                             gif.name, gif.stat().st_size / 1048576)
             except Exception as e:
-                logging.warning("视频处理失败 %s: %s", vurl, e)
+                logging.warning("视频处理失败 %s: %s", str(vurl)[:120], e)
+                if gif.exists():       # 别把转了一半的 GIF 发出去
+                    try:
+                        gif.unlink()
+                    except OSError:
+                        pass
         return paths
 
     def _push_one(self, url: str, name: str, t: dict, groups: list, feed_cfg: dict = None) -> bool:
@@ -290,6 +303,13 @@ class Monitor:
         video_paths = []
         if self.config.get("send_videos", True) and t.get("videos"):
             video_paths = self._prepare_videos(t)
+            if not video_paths:
+                # GIF 全失败时至少把原视频直链放到消息最前面（QQ 按字节截尾，
+                # 放前缀才不会被裁掉），保证群里还能点开看视频。
+                link = str(t["videos"][0])[:180]
+                text = f"🎬 视频/动图直链：{link}\n" + text
+                logging.warning("[%s] %s 的 GIF 生成全部失败，改为附带视频直链",
+                                name, t["id"])
         try:
             ok_groups, failed = self.bot.send_post(groups, text, images, video_paths, at_all=at_all)
             for f in failed:

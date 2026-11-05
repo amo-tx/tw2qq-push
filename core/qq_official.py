@@ -63,6 +63,15 @@ class OfficialBotClient:
         self._ws_ok = False
         self._ws_info = "未启动"
 
+        # 消息按钮（keyboard / 指令按钮）能力探测：官方对自定义按钮是内邀开通，
+        # 没权限时 API 会报错，这里自动降级成纯文本回复，不影响主流程。
+        self._kb_mode = None             # None | text | markdown | unsupported
+        self._kb_fails = 0
+        self._kb_disabled_until = 0.0
+        self._kb_last_error = None
+        self._kb_sent = 0
+        self._kb_last_sent = None
+
     # ---------- Token ----------
     def _get_token(self) -> str:
         with self._token_lock:
@@ -111,9 +120,22 @@ class OfficialBotClient:
         return [{"group_id": oid, "group_name": v.get("alias") or f"官方群 {oid[:12]}…"}
                 for oid, v in items]
 
+    @staticmethod
+    def _image_file_name(raw: bytes) -> str:
+        """按真实内容给后缀：GIF 动图以前一律叫 tweet.png，平台会按 PNG 解码，
+        这是群里 GIF 发不出来/变成静态图的一个直接原因。"""
+        if raw[:3] in (b"GIF", b"gif"):
+            return "tweet.gif"
+        if raw[:8] == b"\x89PNG\r\n\x1a\n":
+            return "tweet.png"
+        if raw[:2] == b"\xff\xd8":
+            return "tweet.jpg"
+        if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+            return "tweet.webp"
+        return "tweet.png"
+
     def _upload_group_image(self, group_openid: str, img: str) -> str:
-        """上传图片返回 file_info。优先二进制直传（≤5MB，已真机验证），
-        失败回退平台 URL 拉取。"""
+        """上传图片/GIF 返回 file_info。优先二进制直传（≤5MB），失败回退平台 URL 拉取。"""
         raw = None
         url = str(img)
         if url.startswith("base64://"):
@@ -122,34 +144,43 @@ class OfficialBotClient:
             raw = Path(url[7:]).read_bytes()
         elif url.startswith("http"):
             r = requests.get(url, timeout=30,
-                             headers={"User-Agent": "Mozilla/5.0"})
+                             headers={"User-Agent": "Mozilla/5.0",
+                                      "Referer": "https://x.com/"})
             r.raise_for_status()
             raw = r.content
-        else:  # 本地路径
+        else:  # 本地路径（推文图片下载缓存 / 视频转出的 GIF）
             raw = Path(url).read_bytes()
 
         if raw and len(raw) <= 5 * 1024 * 1024:
+            name = self._image_file_name(raw)
             try:
                 media = self._api(
                     "POST", f"/v2/groups/{group_openid}/files",
-                    {"file_type": 1, "file_name": "tweet.png",
+                    {"file_type": 1, "file_name": name,
                      "file_data": base64.b64encode(raw).decode(),
                      "srv_send_msg": False})
                 fi = media.get("file_info")
                 if fi:
+                    if name.endswith(".gif"):
+                        logging.info("GIF 已上传: %s (%.2f MB)",
+                                     name, len(raw) / 1048576)
                     return fi
                 logging.warning("二进制直传未返回 file_info: %s", media)
             except Exception as e:
-                logging.warning("二进制直传失败，尝试 URL 拉取: %s", e)
+                logging.warning("二进制直传失败(%s)，尝试 URL 拉取: %s", name, e)
 
         # 回退：平台 URL 拉取（仅 http 链接可用）
         if url.startswith("http"):
-            media = self._api("POST", f"/v2/groups/{group_openid}/files",
-                              {"file_type": 1, "url": url, "srv_send_msg": False})
-            fi = media.get("file_info")
-            if fi:
-                return fi
-        raise RuntimeError("图片上传失败（二进制与 URL 两种方式均未成功）")
+            try:
+                media = self._api("POST", f"/v2/groups/{group_openid}/files",
+                                  {"file_type": 1, "url": url, "srv_send_msg": False})
+                fi = media.get("file_info")
+                if fi:
+                    return fi
+            except Exception as e:
+                logging.warning("URL 拉取方式也失败: %s", e)
+        raise RuntimeError(
+            f"图片上传失败（大小 {len(raw or b'') / 1048576:.2f} MB，二进制与 URL 均未成功）")
 
     @staticmethod
     def _clip(text: str, limit: int = 1000) -> str:
@@ -159,22 +190,88 @@ class OfficialBotClient:
             return str(text)
         return raw[:limit].decode("utf-8", "ignore")
 
-    def reply_group_msg(self, group_openid: str, msg_id: str, text: str,
-                        msg_seq: int = 1) -> dict:
-        """被动回复群内 @ 消息。msg_id 必须来自 GROUP_AT_MESSAGE_CREATE 事件，
-        有效期 5 分钟；被动回复不占用主动消息配额。"""
-        payload = {"msg_type": 0, "content": self._clip(text),
-                   "msg_id": str(msg_id), "msg_seq": msg_seq}
-        path = f"/v2/groups/{group_openid}/messages"
-        try:
-            return self._api("POST", path, payload)
-        except Exception as e:
-            # 部分版本不接受 msg_seq，去掉后再试一次
-            logging.warning("带 msg_seq 的被动回复失败，重试: %s", e)
-            payload.pop("msg_seq", None)
-            return self._api("POST", path, payload)
+    # ---------- 消息按钮（内嵌键盘）能力探测 ----------
+    @staticmethod
+    def _markdown_text(text: str) -> str:
+        """按钮可能只能挂在 markdown 消息上；转义纯文本里会误渲染的符号。"""
+        return (str(text).replace("\\", "\\\\").replace("`", "\\`")
+                .replace("[", "\\[").replace("]", "\\]"))
 
-    def send_group_msg(self, group_openid: str, segments: list) -> dict:
+    def keyboard_state(self) -> dict:
+        return {
+            "supported": self._kb_mode in ("text", "markdown"),
+            "mode": self._kb_mode or "unknown",
+            "sent": self._kb_sent,
+            "last_sent": self._kb_last_sent,
+            "last_error": self._kb_last_error,
+            "failures": self._kb_fails,
+            "cooldown_seconds": max(0, int(self._kb_disabled_until - time.time())),
+        }
+
+    def _kb_available(self) -> bool:
+        if self._kb_mode == "unsupported" and time.time() >= self._kb_disabled_until:
+            self._kb_mode, self._kb_fails = None, 0   # 冷却后重新探测
+        return time.time() >= self._kb_disabled_until
+
+    def _kb_note(self, mode: str, ok: bool, err=None):
+        if ok and mode in ("text", "markdown"):
+            self._kb_mode, self._kb_fails = mode, 0
+            self._kb_last_error = None
+            self._kb_sent += 1
+            self._kb_last_sent = time.strftime("%Y-%m-%d %H:%M:%S")
+        elif mode in ("text", "markdown"):
+            self._kb_last_error = str(err)[:160]
+            self._kb_fails += 1
+            if self._kb_fails >= 3:
+                self._kb_mode = "unsupported"
+                self._kb_disabled_until = time.time() + 3600
+                logging.warning("消息按钮权限不可用，1 小时内降级为纯文本: %s",
+                                self._kb_last_error)
+
+    def reply_group_msg(self, group_openid: str, msg_id: str, text: str,
+                        msg_seq: int = 1, keyboard=None) -> dict:
+        """被动回复群内 @ 消息，可附带指令按钮 keyboard。
+
+        尝试顺序：文本+按钮 → markdown+按钮 → 纯文本 → 纯文本(不带 msg_seq)。
+        按钮权限未开通时前两步会报错，后两步保证指令回复一定送达。
+        每次尝试用不同 msg_seq，避免平台「消息被去重」。
+        """
+        path = f"/v2/groups/{group_openid}/messages"
+        content = self._clip(text)
+        base = {"content": content, "msg_id": str(msg_id)}
+        attempts = []
+        if keyboard and self._kb_available():
+            if self._kb_mode in (None, "text"):
+                attempts.append(("text", dict(base, msg_type=0,
+                                              keyboard=keyboard)))
+            if self._kb_mode in (None, "markdown"):
+                attempts.append(("markdown", {
+                    "msg_type": 2,
+                    "markdown": {"content": self._markdown_text(content)},
+                    "keyboard": keyboard, "msg_id": str(msg_id),
+                }))
+        attempts.append(("plain", dict(base, msg_type=0)))
+        seq, errors = msg_seq, []
+        for mode, payload in attempts:
+            payload["msg_seq"] = seq
+            seq += 1
+            try:
+                res = self._api("POST", path, payload)
+                if mode != "plain":
+                    self._kb_note(mode, True)
+                return res
+            except Exception as e:
+                errors.append(f"{mode}: {str(e)[:100]}")
+                if mode != "plain":
+                    self._kb_note(mode, False, e)
+        try:  # 部分版本不接受 msg_seq
+            return self._api("POST", path, dict(base, msg_type=0))
+        except Exception as e:
+            raise RuntimeError("被动回复失败: " + " | ".join(errors[-3:])
+                               + f" | no-seq: {str(e)[:80]}")
+
+    def send_group_msg(self, group_openid: str, segments: list,
+                       keyboard=None) -> dict:
         """发送一条群消息。segments 为 OneBot v11 消息段数组（text/image）。"""
         text = "".join(s["data"].get("text", "") for s in segments
                        if s.get("type") == "text")
@@ -183,11 +280,23 @@ class OfficialBotClient:
         images = [u for u in images if u]
 
         results = []
-        # 1) 文本
+        path = f"/v2/groups/{group_openid}/messages"
+        # 1) 文本（可带按钮面板）
         if text:
-            results.append(self._api("POST", f"/v2/groups/{group_openid}/messages",
-                                     {"msg_type": 0, "content": self._clip(text),
-                                      "msg_seq": 1}))
+            payload = {"msg_type": 0, "content": self._clip(text), "msg_seq": 1}
+            if keyboard:
+                payload["keyboard"] = keyboard
+            try:
+                results.append(self._api("POST", path, payload))
+                if keyboard:
+                    self._kb_note("text", True)
+            except Exception as e:
+                if not keyboard:
+                    raise
+                logging.warning("主动消息按钮失败，降级为纯文本: %s", e)
+                self._kb_note("text", False, e)
+                results.append(self._api("POST", path, {
+                    "msg_type": 0, "content": self._clip(text), "msg_seq": 2}))
         # 2) 图片：本地下载后 base64 直传（腾讯服务器拉不到 X 图床，需自己下载）
         for img in images:
             url = img[8:] if str(img).startswith("base64://") else str(img)

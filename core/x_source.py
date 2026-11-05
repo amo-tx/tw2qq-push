@@ -12,6 +12,7 @@ import logging
 import time
 import re
 import secrets
+import threading
 
 import requests
 
@@ -108,6 +109,62 @@ def _extract_api_creds(s: requests.Session, html: str, limit: int = 10) -> tuple
 _CTX_CACHE = {"key": None, "ts": 0.0, "ctx": None}   # 登录态上下文缓存（避免每轮轮询重复抓页面/JS）
 _UID_CACHE = {}                                       # handle -> rest_id
 _CTX_TTL = 900                                        # 15 分钟
+_TWEETS_CACHE = {}                                    # handle -> (ts, tweets)：限流时复用
+_X_LOCK = threading.Lock()
+_X_LAST_REQ = 0.0                                     # 全局最小请求间隔，避免多博主并发把 X 打到 429
+_X_BACKOFF = {"until": 0.0, "reason": ""}
+_SYND_BACKOFF = {"until": 0.0}
+MIN_REQ_GAP = 1.2
+
+
+def _backoff(seconds: int, reason: str):
+    with _X_LOCK:
+        _X_BACKOFF.update(until=max(_X_BACKOFF["until"], time.time() + seconds),
+                          reason=reason[:120])
+
+
+def _x_get(s: requests.Session, url: str, **kw):
+    """带全局节流与限流退避的 GET（只用于 X GraphQL / REST 接口）。"""
+    global _X_LAST_REQ
+    with _X_LOCK:
+        now = time.time()
+        left = _X_BACKOFF["until"] - now
+        if left > 0:
+            raise RuntimeError(f"X 限流退避中（{_X_BACKOFF['reason']}），{int(left)} 秒后自动重试")
+        gap = MIN_REQ_GAP - (now - _X_LAST_REQ)
+        if gap > 0:
+            time.sleep(min(gap, 3.0))
+        _X_LAST_REQ = time.time()
+    return s.get(url, **kw)
+
+
+def _json_response(r, label: str) -> dict:
+    """把「空响应 / HTML 风控页」变成可读错误，并触发退避，避免每轮硬刷。"""
+    ct = (r.headers.get("Content-Type") or "").lower()
+    body = (r.text or "").strip()
+    if r.status_code in (420, 429):
+        _backoff(300, f"{label} HTTP 429 限流")
+        raise RuntimeError(f"{label} 被 X 限流（HTTP 429），已自动退避 5 分钟")
+    if r.status_code >= 500:
+        _backoff(120, f"{label} HTTP {r.status_code}")
+        raise RuntimeError(f"{label} 服务端错误 HTTP {r.status_code}")
+    if r.status_code != 200:
+        raise RuntimeError(f"{label} HTTP {r.status_code} ({ct}) {body[:100]!r}")
+    if "json" not in ct and not body.startswith(("{", "[")):
+        _backoff(90, f"{label} 返回非 JSON")
+        raise RuntimeError(f"{label} 返回非 JSON（HTTP {r.status_code} {ct}）: {body[:100]!r}")
+    try:
+        return r.json()
+    except ValueError:
+        _backoff(90, f"{label} 响应无法解析")
+        raise RuntimeError(f"{label} 响应不是合法 JSON: {body[:100]!r}")
+
+
+def x_backoff_state() -> dict:
+    remain = _X_BACKOFF["until"] - time.time()
+    left = max(0, int(remain))
+    return {"active": remain > 0, "seconds_left": left,
+            "reason": _X_BACKOFF["reason"] if remain > 0 else ""}
 
 
 def _authed_context(auth_token: str, force: bool = False) -> tuple:
@@ -250,25 +307,111 @@ def validate_cookie(auth_token: str) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+def _media_kind(m: dict) -> str:
+    """兼容新旧 X 响应：type=photo/video/animated_gif 或 __typename=ApiVideo 等。"""
+    t = (m.get("type") or "").lower().replace(" ", "")
+    if t:
+        return t
+    tn = (m.get("__typename") or "").lower()
+    if "animatedgif" in tn or tn.endswith("gif"):
+        return "animated_gif"
+    if "video" in tn:
+        return "video"
+    return "photo"
+
+
+def _video_urls(m: dict) -> list:
+    """从一条 media 对象里找出可播放地址（优先最高码率 mp4，其次 HLS）。
+
+    新版 X 会把变体放在 video_info / videoInfo / variants / media_info 里，
+    且 animated_gif 的 media_url_https 只是 ext_tw_video_thumb 的 jpg 封面，
+    必须靠变体才拿得到真正的 mp4 —— 这是以前 GIF 一条都发不出来的主因。
+    """
+    urls = []
+    raw = m.get("media_url_https") or m.get("media_url") or m.get("url") or ""
+    if isinstance(raw, str) and re.search(r"\.(mp4|m4v|mov|m3u8)(\?|$)", raw, re.I):
+        urls.append(raw)
+
+    vi = m.get("video_info") or m.get("videoInfo") or {}
+    if not isinstance(vi, dict):
+        vi = {}
+    variants = list(vi.get("variants") or [])
+    for extra in (m.get("variants"), (m.get("media_info") or {}).get("variants")):
+        if isinstance(extra, list):
+            variants += [v for v in extra if isinstance(v, dict)]
+    mp4, hls = [], []
+    for v in variants:
+        if not isinstance(v, dict):
+            continue
+        u = v.get("url") or v.get("src") or ""
+        ct = (v.get("content_type") or v.get("type") or "").lower()
+        if not u:
+            continue
+        if "mp4" in ct or re.search(r"\.mp4(\?|$)", u, re.I):
+            mp4.append((int(v.get("bitrate") or 0), u))
+        elif "mpegurl" in ct or "m3u8" in ct or re.search(r"\.m3u8(\?|$)", u, re.I):
+            hls.append(u)
+    if mp4:
+        mp4.sort(key=lambda x: x[0], reverse=True)
+        urls.append(mp4[0][1])
+    elif hls:
+        urls.append(hls[0])
+
+    for key in ("video_url", "videoUrl", "playback_url"):
+        u = m.get(key)
+        if isinstance(u, str) and u.startswith("http"):
+            urls.append(u)
+    return list(dict.fromkeys(urls))
+
+
 def _parse_media(media_list: list) -> tuple:
-    """从 syndication media 数组提取 (图片列表, 视频列表)"""
+    """从 media 数组提取 (图片列表, 视频/动图列表)，兼容 syndication 与 GraphQL。"""
     images, videos = [], []
     for m in media_list or []:
-        mtype = (m.get("type") or "").lower()
-        url = m.get("media_url_https") or m.get("media_url") or ""
-        if "video.twimg.com" in url and (mtype in ("video", "animated_gif") or url.endswith(".mp4")):
-            videos.append(url)
-        elif url:
-            images.append(url)
-        # video_info 变体里取最高码率 mp4
-        vi = m.get("video_info") or {}
-        variants = [v for v in vi.get("variants", [])
-                    if "video/mp4" in (v.get("content_type") or "")]
-        if variants:
-            best = max(variants, key=lambda v: v.get("bitrate") or 0)
-            if best.get("url") and best["url"] not in videos:
-                videos.append(best["url"])
-    return images, videos
+        if not isinstance(m, dict):
+            continue
+        vurls = _video_urls(m)
+        kind = _media_kind(m)
+        if vurls:
+            videos.extend(vurls)
+            # 视频/动图的封面缩略图不再当图片发送，避免群里多一张静态封面
+            continue
+        url = m.get("media_url_https") or m.get("media_url") or m.get("url") or ""
+        if not isinstance(url, str) or not url.startswith("http"):
+            continue
+        is_videoish = kind in ("video", "animated_gif") or "video.twimg.com" in url
+        if is_videoish and "ext_tw_video_thumb" in url:
+            continue
+        images.append(url)
+    return list(dict.fromkeys(images)), list(dict.fromkeys(videos))
+
+
+def _collect_media(res: dict, legacy: dict) -> list:
+    """汇总一条推文里所有可能存放媒体的位置（X 改版后位置不固定）。"""
+    pools = []
+    for src in (legacy.get("extended_entities"), legacy.get("entities"),
+                res.get("extended_entities"), res.get("entities")):
+        if isinstance(src, dict):
+            pools += [x for x in (src.get("media") or []) if isinstance(x, dict)]
+    for key in ("media", "mediaEntities", "media_entities"):
+        extra = res.get(key)
+        if isinstance(extra, list):
+            pools += [x for x in extra if isinstance(x, dict)]
+    # 去重：优先 media_key，其次 id_str，最后 url；同一媒体保留信息更全的那份
+    # （entities 里的通常只有封面，extended_entities 里才带 video_info）。
+    out, seen = [], {}
+    for m in pools:
+        k = (str(m.get("media_key") or "") or str(m.get("id_str") or "")
+             or str(m.get("media_url_https") or m.get("media_url") or ""))
+        if k and k in seen:
+            idx = seen[k]
+            if not _video_urls(out[idx]) and _video_urls(m):
+                out[idx] = m
+            continue
+        if k:
+            seen[k] = len(out)
+        out.append(m)
+    return out
 
 
 def _parse_x_time(s: str) -> int:
@@ -328,8 +471,8 @@ def _target_uid(s: requests.Session, bearer: str, ct0: str, handle: str, qids: d
     return uid
 
 
-def _fetch_tweets_graphql(auth_token: str, handle: str, count: int = 20) -> list:
-    """登录态 GraphQL UserTweets 时间线（syndication 改版后的主通道）"""
+def _gql_timeline(auth_token: str, handle: str, count: int = 20) -> tuple:
+    """请求 UserTweets，返回 (data, meta)；meta 只含可诊断的非敏感信息。"""
     s, bearer, ct0, uid, qids = _authed_context(auth_token)
     qid = qids.get("UserTweets")
     if not qid:
@@ -339,15 +482,36 @@ def _fetch_tweets_graphql(auth_token: str, handle: str, count: int = 20) -> list
                  "includePromotedContent": False,
                  "withQuickPromoteEligibilityTweetFields": True,
                  "withVoice": False}
-    r = s.get(
-        f"https://x.com/i/api/graphql/{qid}/UserTweets",
+    r = _x_get(
+        s, f"https://x.com/i/api/graphql/{qid}/UserTweets",
         params={"variables": json.dumps(variables), "features": GQL_FEATURES},
         headers=_api_headers(bearer, ct0, f"https://x.com/{handle}"),
         timeout=25,
     )
-    data = r.json()
-    if r.status_code != 200 or data.get("errors"):
-        raise RuntimeError(f"UserTweets 失败 HTTP {r.status_code}: {str(data.get('errors'))[:120]}")
+    meta = {"http": r.status_code,
+            "content_type": r.headers.get("Content-Type", ""),
+            "bytes": len(r.content or b""),
+            "query_id": qid, "target_uid": tuid,
+            "body_head": (r.text or "")[:160]}
+    data = _json_response(r, f"UserTweets[@{handle}]")
+    errors = data.get("errors")
+    if errors:
+        meta["errors"] = str(errors)[:200]
+        raise RuntimeError(f"UserTweets 返回错误: {str(errors)[:160]}")
+    meta["body_head"] = ""      # 成功响应不需要回传正文片段
+    return data, meta
+
+
+def _tweet_text(res: dict, legacy: dict) -> str:
+    """长推文（note_tweet）正文不在 legacy.full_text 里。"""
+    note = (((res.get("note_tweet") or {}).get("note_tweet_results") or {})
+            .get("result") or {})
+    return note.get("text") or legacy.get("full_text", "")
+
+
+def _fetch_tweets_graphql(auth_token: str, handle: str, count: int = 20) -> list:
+    """登录态 GraphQL UserTweets 时间线（syndication 改版后的主通道）"""
+    data, _meta = _gql_timeline(auth_token, handle, count)
     tl = (((data.get("data") or {}).get("user") or {}).get("result") or {})
     tl = (tl.get("timeline_v2") or tl.get("timeline") or {}).get("timeline") or {}
 
@@ -371,11 +535,17 @@ def _fetch_tweets_graphql(auth_token: str, handle: str, count: int = 20) -> list
         for item in items:
             tc = item.get("itemContent") or item.get("tweetResults") or {}
             res = (tc.get("tweet_results") or {}).get("result") or {}
-            if not res or res.get("__typename") == "TweetTombstone" or not res.get("legacy"):
+            if not res or res.get("__typename") == "TweetTombstone":
                 continue
             # 转推：取被转推的原推
             if res.get("retweeted_status_result"):
                 res = (res["retweeted_status_result"].get("result") or res)
+            # 新版 X 把可见性受限推文包一层 TweetWithVisibilityResults，
+            # 正文在 result.tweet 里；不解包会整条跳过（视频推文常属于这类）。
+            if not res.get("legacy") and isinstance(res.get("tweet"), dict):
+                res = res["tweet"]
+            if not isinstance(res.get("legacy"), dict):
+                continue
             legacy = res.get("legacy") or {}
             core = ((res.get("core") or {}).get("user_results") or {}).get("result") or {}
             sn = (core.get("legacy") or {}).get("screen_name") or handle
@@ -386,33 +556,50 @@ def _fetch_tweets_graphql(auth_token: str, handle: str, count: int = 20) -> list
                 "id": f"x_{tid}",
                 "author": sn,
                 "link": f"https://x.com/{sn}/status/{tid}",
-                "text": legacy.get("full_text", ""),
+                "text": _tweet_text(res, legacy),
                 "images": [], "videos": [],  # 下面统一从 media 提取
                 "ts": _parse_x_time(legacy.get("created_at") or ""),
-                "_media": (legacy.get("extended_entities") or {}).get("media") or [],
+                "_media": _collect_media(res, legacy),
             })
-    # 复用 syndication 的媒体解析逻辑
     for t in out:
-        media = t.pop("_media", None)
-        if media:
-            t["images"], t["videos"] = _parse_media(media)
-    logging.info("X 通道 GraphQL [%s] 获取 %d 条推文", handle, len(out))
+        media = t.pop("_media", [])
+        t["images"], t["videos"] = _parse_media(media)
+    n_img = sum(len(t["images"]) for t in out)
+    n_vid = sum(len(t["videos"]) for t in out)
+    logging.info("X 通道 GraphQL [%s] %d 条推文（图片 %d / 视频·动图 %d）",
+                 handle, len(out), n_img, n_vid)
     return out
 
 
 def fetch_user_tweets(handle: str, auth_token: str = "", timeout: int = 30) -> list:
     """拉取某博主最近推文：登录态 GraphQL 优先，公开 syndication 兜底"""
     handle = handle.strip().lstrip("@")
+    reason = ""
 
     # 主通道：GraphQL UserTweets（auth_token 有效时稳定，syndication 已被 X 改版为返回 HTML）
     if auth_token:
         try:
-            return _fetch_tweets_graphql(auth_token, handle)
+            tweets = _fetch_tweets_graphql(auth_token, handle)
+            _TWEETS_CACHE[handle] = (time.time(), tweets)
+            return tweets
         except Exception as e:
-            logging.warning("GraphQL 时间线 [%s] 失败，改走 syndication 兜底: %s", handle, e)
-            # 登录态相关错误不宜再走公开通道（会得到同样的风控页面），直接上抛更清晰
-            if "auth_token 已失效" in str(e):
+            reason = str(e)
+            logging.warning("GraphQL 时间线 [%s] 失败: %s", handle, reason)
+            if "auth_token 已失效" in reason:
                 raise
+            # 限流期间复用上次成功的时间线：seen 去重表保证不会重复推送，
+            # 也避免 10 个博主 × 每 2 分钟持续撞 X 的 429，越刷越封。
+            cached = _TWEETS_CACHE.get(handle)
+            if cached and time.time() - cached[0] < 900:
+                logging.warning("[%s] X 暂不可用，复用 %d 分钟前的时间线缓存",
+                                handle, int((time.time() - cached[0]) / 60))
+                return cached[1]
+
+    with _X_LOCK:
+        cooldown_left = _SYND_BACKOFF["until"] - time.time()
+    if cooldown_left > 0:
+        raise RuntimeError(
+            f"X 时间线暂不可用：{reason or '未配置 auth_token'}；公开通道冷却中（{int(cooldown_left)} 秒后重试）")
 
     s = _session(auth_token)
     r = s.get(
@@ -420,6 +607,10 @@ def fetch_user_tweets(handle: str, auth_token: str = "", timeout: int = 30) -> l
         params={"showreplies": "false"},
         timeout=timeout,
     )
+    if r.status_code in (420, 429):
+        with _X_LOCK:
+            _SYND_BACKOFF["until"] = time.time() + 600
+        raise RuntimeError("X 公开时间线被限流（HTTP 429），已冷却 10 分钟")
     if r.status_code != 200:
         raise RuntimeError(f"X 时间线拉取失败 HTTP {r.status_code}（博主不存在或接口受限）")
     try:
@@ -431,6 +622,98 @@ def fetch_user_tweets(handle: str, auth_token: str = "", timeout: int = 30) -> l
     entries = (data.get("timeline") or {}).get("entries") or data.get("entries") or []
     out = [_parse_tweet(e, handle) for e in entries if e.get("type", "tweet") == "tweet" or (e.get("content") or {}).get("tweet")]
     logging.info("X 通道 syndication [%s] 获取 %d 条推文", handle, len(out))
+    return out
+
+
+def diagnose_timeline(handle: str, auth_token: str, probe: bool = True,
+                      count: int = 8) -> dict:
+    """线上只读诊断：返回真实 UserTweets 响应里媒体字段的结构与视频地址可达性。
+
+    不返回 auth_token / Bearer / Cookie；用于确认「视频到底有没有解析出来、
+    解析出来后 CDN 能不能下载」，避免靠猜改代码。
+    """
+    handle = (handle or "").strip().lstrip("@")
+    out = {"ok": True, "handle": handle, "backoff": x_backoff_state(),
+           "tweets": [], "counts": {"tweets": 0, "images": 0, "videos": 0}}
+    try:
+        data, meta = _gql_timeline(auth_token, handle, count)
+    except Exception as e:
+        out.update(ok=False, error=str(e)[:220], backoff=x_backoff_state())
+        return out
+    out["meta"] = meta
+    tl = (((data.get("data") or {}).get("user") or {}).get("result") or {})
+    tl = (tl.get("timeline_v2") or tl.get("timeline") or {}).get("timeline") or {}
+    entries = []
+    for ins in tl.get("instructions") or []:
+        if ins.get("type") == "TimelineAddEntries":
+            entries += ins.get("entries") or []
+        elif ins.get("type") == "TimelinePinEntry" and ins.get("entry"):
+            entries.append(ins["entry"])
+
+    all_videos = []
+    for e in entries:
+        content = e.get("content") or {}
+        items = [content]
+        for mod in content.get("moduleItems") or []:
+            items.append(mod.get("item") or mod)
+        for it in content.get("items") or []:
+            items.append(it.get("item") or it)
+        for item in items:
+            tc = item.get("itemContent") or item.get("tweetResults") or {}
+            res = (tc.get("tweet_results") or {}).get("result") or {}
+            if not isinstance(res, dict) or not res:
+                continue
+            tn = res.get("__typename") or ""
+            if res.get("retweeted_status_result"):
+                res = (res["retweeted_status_result"].get("result") or res)
+            if not res.get("legacy") and isinstance(res.get("tweet"), dict):
+                res = res["tweet"]
+            legacy = res.get("legacy") or {}
+            if not isinstance(legacy, dict) or not legacy:
+                continue
+            media = _collect_media(res, legacy)
+            imgs, vids = _parse_media(media)
+            all_videos += vids
+            out["tweets"].append({
+                "id": legacy.get("id_str") or res.get("rest_id") or "",
+                "typename": tn,
+                "media": len(media),
+                "media_kinds": [_media_kind(m) for m in media],
+                "media_fields": [sorted(m.keys())[:20] for m in media],
+                "variant_types": [
+                    [str(v.get("content_type")) for v in
+                     ((m.get("video_info") or {}).get("variants") or [])]
+                    for m in media],
+                "images": len(imgs), "videos": len(vids),
+                "video_urls": [u[:120] for u in vids[:2]],
+            })
+            if len(out["tweets"]) >= count:
+                break
+        if len(out["tweets"]) >= count:
+            break
+    out["counts"] = {
+        "tweets": len(out["tweets"]),
+        "images": sum(t["images"] for t in out["tweets"]),
+        "videos": sum(t["videos"] for t in out["tweets"]),
+    }
+    if probe and all_videos:
+        url = all_videos[0]
+        host = (re.match(r"https?://([^/]+)", url) or [None, ""])[1]
+        try:
+            r = requests.get(
+                url, headers={"User-Agent": "Mozilla/5.0",
+                              "Referer": "https://x.com/",
+                              "Range": "bytes=0-1023"},
+                stream=True, timeout=20)
+            out["media_probe"] = {
+                "host": host, "http": r.status_code,
+                "content_type": r.headers.get("Content-Type", ""),
+                "content_length": r.headers.get("Content-Length", ""),
+                "accept_ranges": r.headers.get("Accept-Ranges", ""),
+            }
+            r.close()
+        except Exception as e:
+            out["media_probe"] = {"host": host, "error": f"{type(e).__name__}: {str(e)[:120]}"}
     return out
 
 
