@@ -151,6 +151,21 @@ class OfficialBotClient:
                 return fi
         raise RuntimeError("图片上传失败（二进制与 URL 两种方式均未成功）")
 
+    def reply_group_msg(self, group_openid: str, msg_id: str, text: str,
+                        msg_seq: int = 1) -> dict:
+        """被动回复群内 @ 消息。msg_id 必须来自 GROUP_AT_MESSAGE_CREATE 事件，
+        有效期 5 分钟；被动回复不占用主动消息配额。"""
+        payload = {"msg_type": 0, "content": str(text)[:1000],
+                   "msg_id": str(msg_id), "msg_seq": msg_seq}
+        path = f"/v2/groups/{group_openid}/messages"
+        try:
+            return self._api("POST", path, payload)
+        except Exception as e:
+            # 部分版本不接受 msg_seq，去掉后再试一次
+            logging.warning("带 msg_seq 的被动回复失败，重试: %s", e)
+            payload.pop("msg_seq", None)
+            return self._api("POST", path, payload)
+
     def send_group_msg(self, group_openid: str, segments: list) -> dict:
         """发送一条群消息。segments 为 OneBot v11 消息段数组（text/image）。"""
         text = "".join(s["data"].get("text", "") for s in segments
@@ -338,15 +353,22 @@ class OfficialBotClient:
             if t in ("GROUP_ADD_ROBOT", "GROUP_AT_MESSAGE_CREATE",
                      "GROUP_MSG_RECEIVE"):
                 oid = d.get("group_openid")
-                if oid:
-                    alias = f"群消息 {d.get('content', '')[:10]}" if t == "GROUP_AT_MESSAGE_CREATE" else ""
-                    self._save_group(oid, {"alias": alias} if alias else None)
+                # 只在首次发现群时落盘；@ 消息不再覆盖已有群别名，
+                # 也避免每条群消息都写一次文件 + 云数据库。
+                if oid and oid not in self._groups:
+                    self._save_group(oid)
             elif t == "C2C_MESSAGE_CREATE":
                 oid = d.get("user_openid") or d.get("openid")
                 if oid:
                     self._save_c2c(oid, d)
             elif t == "READY":
                 logging.info("官方机器人 WS Ready: %s", d.get("user", {}).get("id"))
+            # @ 机器人指令：独立线程处理，避免指令动作（抓取/配置写入）
+            # 阻塞 WS 的收包与心跳，导致平台判定掉线。
+            at_hook = getattr(self, "on_group_at", None)
+            if t == "GROUP_AT_MESSAGE_CREATE" and callable(at_hook):
+                threading.Thread(target=self._safe_at_hook, args=(at_hook, d),
+                                 daemon=True, name="official-at").start()
             # 外部事件钩子（测试/扩展用）
             hook = getattr(self, "on_event", None)
             if callable(hook):
@@ -356,6 +378,13 @@ class OfficialBotClient:
                     logging.warning("on_event 钩子异常: %s", e)
         elif op == 11:  # Heartbeat ACK
             pass
+
+    @staticmethod
+    def _safe_at_hook(hook, d: dict):
+        try:
+            hook("GROUP_AT_MESSAGE_CREATE", d)
+        except Exception as e:
+            logging.warning("官方 @指令 钩子异常: %s", e)
 
     def _ws_heartbeat(self, ws, interval: float):
         while not self._ws_stop.is_set() and self._ws_ok:
