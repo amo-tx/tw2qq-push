@@ -479,6 +479,11 @@ class Monitor:
         logging.info("轮询线程启动（快速模式）：每个博主每 %d 秒抓取一次（错峰）", poll_seconds)
         while not self._stop_event.is_set():
             self._maybe_reload_config()
+            # 每轮重读配置：群指令「间隔 N」改完即刻生效，不必重启轮询线程
+            cur = int(self.config.get("poll_seconds") or 0) or poll_seconds
+            if cur != poll_seconds:
+                logging.info("抓取间隔已更新：%d → %d 秒", poll_seconds, cur)
+                poll_seconds = cur
             self._fast_tick(poll_seconds)
             if self._stop_event.wait(5):
                 return
