@@ -50,7 +50,17 @@ GQL_FEATURES = json.dumps({
 
 
 def _session(auth_token: str = "") -> requests.Session:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
     s = requests.Session()
+    # 云端冷启动：本地 mihomo 内核可能比 Web 服务晚几秒才监听 7890，此时所有
+    # x.com 请求都会抛 ProxyError（表现为「GIF/视频拉不到」甚至整轮抓取失败）。
+    # 只对连接类错误做短重试；status/read 都设为 0，绝不重试 429/5xx，以免
+    # 在 X 限流时火上浇油。Retry 默认只覆盖 GET/HEAD 等幂等方法。
+    _retry = Retry(total=3, connect=3, read=0, status=0, backoff_factor=0.7)
+    s.mount("https://", HTTPAdapter(max_retries=_retry))
+    s.mount("http://", HTTPAdapter(max_retries=_retry))
     s.headers.update(UA)
     if auth_token:
         s.cookies.set("auth_token", auth_token, domain=".x.com")
@@ -700,7 +710,7 @@ def diagnose_timeline(handle: str, auth_token: str, probe: bool = True,
         url = all_videos[0]
         host = (re.match(r"https?://([^/]+)", url) or [None, ""])[1]
         try:
-            r = requests.get(
+            r = _session().get(
                 url, headers={"User-Agent": "Mozilla/5.0",
                               "Referer": "https://x.com/",
                               "Range": "bytes=0-1023"},
