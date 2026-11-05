@@ -93,6 +93,8 @@ class Monitor:
         self.config = {}
         self.store = None
         self.bot = None
+        self.manual_pause = False   # 群指令「暂停」：常驻守护不得自动拉起
+        self.save_config_hook = None  # webui._save_config_key（供 @ 指令写配置）
         self.interval = 600
         self.reload_config()
 
@@ -145,6 +147,14 @@ class Monitor:
         self.interval = int(self.config.get("interval_minutes", 10)) * 60
         # 全局代理（x.com / GitHub 走 ChromeGo 等本地加速通道）
         net.apply_proxy((self.config.get("network") or {}).get("proxy", ""))
+        # 官方通道：把 WS 的 @ 事件接到指令处理器。reload_config 可能重建
+        # bot，因此每次重载都重新挂载（内部幂等，不会重复计数）。
+        if hasattr(self.bot, "start_ws"):
+            try:
+                from core.commands import attach_official_commands
+                attach_official_commands(self.bot, self, self.save_config_hook)
+            except Exception as e:
+                logging.debug("挂载官方 @指令 失败: %s", e)
 
     # ---------- 状态 ----------
     def status(self) -> dict:
@@ -196,8 +206,15 @@ class Monitor:
             }
             return 0
 
-    def check_once(self):
-        """执行一轮全量检查，返回 (推送条数, 出错源数量)"""
+    def check_once(self, force: bool = False):
+        """执行一轮全量检查，返回 (推送条数, 出错源数量)。
+
+        force=True 用于人工触发（WebUI 的「立即检查」、群指令「检查」），
+        绕过群指令设置的暂停状态。
+        """
+        if self.manual_pause and not force:
+            logging.info("自动推送已被群指令暂停，跳过本轮检查")
+            return 0, 0
         with self.lock:
             if self.checking:
                 return 0, 0
