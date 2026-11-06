@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
@@ -39,8 +40,16 @@ _state = {
     "last_check_age": None,
     "gha_fresh": False,
     "mode": "cloud-app",
+    # 外部唤醒证据（GHA / 监控 / 用户访问 /api/health）
+    "external_pings": 0,
+    "last_external_at": None,
+    "max_external_gap_seconds": 0,
+    "_last_logged_minute": None,
 }
 _lock = threading.Lock()
+
+# 运行时留痕，不随部署包发布（见 core/settings.py RUNTIME_FILES）
+_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "keepalive.log"
 
 
 def state() -> dict:
@@ -48,7 +57,44 @@ def state() -> dict:
         d = dict(_state)
         d["repairs"] = list(d["repairs"][-15:])
     d["uptime_seconds"] = int(time.time() - BOOT_TS)
+    last = d.pop("last_external_at", None)
+    d.pop("_last_logged_minute", None)
+    d["last_external_at"] = (datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M:%S")
+                             if last else None)
+    d["external_gap_seconds"] = int(time.time() - last) if last else None
     return d
+
+
+def note_external():
+    """记录一次「本进程之外」的健康探针。
+
+    这是 24x7 连续在线的可核验证据：/api/health 暴露最近一次外部唤醒
+    时间、当前空窗与进程内最大空窗；同时按分钟在 data/keepalive.log 落
+    一行，sandbox 重启后仍可回看过去是否有分钟级心跳空档。进程内的
+    自我保活请求带 source=self，不算外部唤醒。
+    """
+    now = time.time()
+    minute = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M")
+    with _lock:
+        prev = _state["last_external_at"]
+        gap = int(now - prev) if prev else 0
+        if gap > _state["max_external_gap_seconds"]:
+            _state["max_external_gap_seconds"] = gap
+        _state["last_external_at"] = now
+        _state["external_pings"] += 1
+        first = _state["_last_logged_minute"] != minute
+        _state["_last_logged_minute"] = minute
+    if not first:
+        return
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _LOG_PATH.exists() and _LOG_PATH.stat().st_size > 200_000:
+            lines = _LOG_PATH.read_text(encoding="utf-8").splitlines()[-3000:]
+            _LOG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with _LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write("%s boot=%s gap=%ss\n" % (minute, BOOT_ID, gap))
+    except Exception as e:
+        logging.debug("[守护] 保活留痕失败: %s", e)
 
 
 def _repair(msg):
@@ -194,10 +240,19 @@ def _tick(monitor, chromego, cloud, keepalive_url, stall_seconds,
             logging.debug("[守护] 云端心跳失败: %s", e)
 
 
+def self_ping_url(url: str) -> str:
+    """给进程内自我保活 URL 打标记，避免污染外部唤醒判活证据。"""
+    if not url:
+        return ""
+    return url + ("&" if "?" in url else "?") + "source=self"
+
+
 def start(monitor, chromego, cloud, config: dict):
     """启动守护线程；重复调用安全（幂等）。"""
     cloud_cfg = config.get("cloud") or {}
-    keepalive_url = cloud_cfg.get("keepalive_url") or ""
+    ka_cfg = config.get("keepalive") or {}
+    keepalive_url = self_ping_url(
+        ka_cfg.get("url") or cloud_cfg.get("keepalive_url") or "")
     poll = int(config.get("poll_seconds") or 120)
     stall = max(int(poll * 2.5), 300)
     interval = 30

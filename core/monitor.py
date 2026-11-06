@@ -10,16 +10,58 @@ from pathlib import Path
 import yaml
 
 from core import x_source
+try:
+    from core import tg_source          # 精简副本（GHA）没有 TG 源，可选
+except ImportError:                     # pragma: no cover
+    tg_source = None
 from core import net
 from core.feed import fetch_feed
 from core.formatter import format_message
 from core.media import download_media, video_to_gif, hls_url
+from core.push_guard import PushGuard
 from core.qq_bot import OneBotClient
 from core.ssl_setup import enable_system_trust
 from core.store import Store
 
 # 尽早注入：让 requests 信任 Windows 系统证书库（兼容 Watt Toolkit 等 MITM 加速）
 enable_system_trust()
+
+
+def clean_handle(raw: str) -> str:
+    """兼容 @name / t.me/name / https://t.me/s/name?before=1 等写法。
+
+    放在 monitor 内而不是依赖 tg_source，让精简副本（GHA）也能安全 import。
+    """
+    import re as _re
+    h = (raw or "").strip().lstrip("@")
+    h = _re.sub(r"^https?://", "", h, flags=_re.I)
+    h = _re.sub(r"^t\.me/(?:s/)?", "", h, flags=_re.I)
+    return h.split("/")[0].split("?")[0].strip()
+
+
+def feed_url(f: dict) -> str:
+    """去重存储用的源唯一键。不同来源的 handle 可能重名，必须带协议前缀。"""
+    if (f or {}).get("source") == "telegram":
+        return "tg://" + clean_handle(f.get("handle", ""))
+    return (f or {}).get("url") or f"x://{(f or {}).get('handle')}"
+
+
+def iter_feeds(cfg: dict) -> list:
+    """统一枚举 X 博主 + Telegram 频道（给后者自动打 source 标记与默认群）。
+
+    所有轮询、状态、回测、前端列表都走这里，避免 TG 变成第二条独立支路。
+    """
+    cfg = cfg or {}
+    out = list((cfg.get("twitter") or {}).get("feeds") or [])
+    tg = cfg.get("telegram") or {}
+    if tg.get("enabled", True):
+        default_groups = (cfg.get("qq") or {}).get("groups") or []
+        for c in (tg.get("channels") or []):
+            c = dict(c)
+            c.setdefault("source", "telegram")
+            c.setdefault("groups", list(default_groups))
+            out.append(c)
+    return out
 
 
 class RingLog(logging.Handler):
@@ -107,6 +149,13 @@ class Monitor:
         self._busy_urls = set()  # 正在处理（常规轮询或手动回推）的源 url，二者互斥防重复推送
         self._cfg_mtime = None  # 配置文件 mtime，用于检测外部修改自动重载
         self._last_fetch = {}  # url -> 上次抓取时刻（快速轮询调度用）
+        # 唯一权威的推送闸门：所有「该不该发」的判定都收敛到这里，
+        # 防止部署/重启后补发历史推文刷屏（见 core/push_guard.py 说明）
+        self.guard = PushGuard(lambda: self.store, lambda: self.config)
+        # 发送串行锁：官方机器人把一条推文拆成「1 文本 + N 图片」多次 API 调用。
+        # 常规轮询、手动补推、不同源之间若无锁会交错发送，转发端即使能区分
+        # 也无从判断图片归属，必然串台丢图。整条推文的发送必须原子完成。
+        self._push_lock = threading.Lock()
 
     # ---------- 配置 ----------
     def reload_config(self):
@@ -168,25 +217,27 @@ class Monitor:
             "bot": {"ok": bot_ok, "info": str(bot_info)[:100]},
             "feeds": [
                 {
-                    "name": f.get("name", f.get("handle") or f["url"]),
+                    "name": f.get("name", f.get("handle") or f.get("url") or "?"),
                     "handle": f.get("handle", ""),
                     "url": f.get("url", ""),
+                    "source": f.get("source") or "x",
                     "groups": f.get("groups") or [],
                     **self.feeds_status.get(
-                        f.get("url") or f"x://{f.get('handle')}",
+                        feed_url(f),
                         {"last_ok": None, "last_error": None},
                     ),
                 }
-                for f in self.config["twitter"]["feeds"]
+                for f in iter_feeds(self.config)
             ],
             "groups": self.config["qq"]["groups"],
             "pushed_total": self.store.total_pushed(),
+            "push_guard": self.guard.status(),
         }
 
     # ---------- 核心检查 ----------
     def _check_one_feed(self, feed_cfg: dict) -> int:
         """抓取并处理单个博主，返回推送条数；异常不外抛（记录到 feeds_status）"""
-        url = feed_cfg.get("url") or f"x://{feed_cfg.get('handle')}"
+        url = feed_url(feed_cfg)
         name = feed_cfg.get("name", feed_cfg.get("handle") or url)
         self._last_fetch[url] = time.time()
         try:
@@ -221,14 +272,14 @@ class Monitor:
             self.checking = True
         sent_total, errors = 0, 0
         try:
-            for feed_cfg in self.config["twitter"]["feeds"]:
+            for feed_cfg in iter_feeds(self.config):
                 before = self.feeds_status.get(
-                    feed_cfg.get("url") or f"x://{feed_cfg.get('handle')}", {}
+                    feed_url(feed_cfg), {}
                 ).get("last_error")
                 n = self._check_one_feed(feed_cfg)
                 sent_total += n
                 after = self.feeds_status.get(
-                    feed_cfg.get("url") or f"x://{feed_cfg.get('handle')}", {}
+                    feed_url(feed_cfg), {}
                 ).get("last_error")
                 if after and after != before:
                     errors += 1
@@ -239,7 +290,11 @@ class Monitor:
 
     # ---------- 抓取（RSS / X 通道自动路由） ----------
     def _fetch_tweets(self, feed_cfg: dict) -> list:
-        """handle 存在走 X 公开接口（带 auth_token），否则走 RSS url"""
+        """按 source 分派：telegram 走 t.me/s 预览页，X 走公开接口，其余走 RSS。"""
+        if feed_cfg.get("source") == "telegram":
+            if tg_source is None:
+                raise RuntimeError("当前副本未包含 Telegram 源模块")
+            return tg_source.fetch_channel(feed_cfg["handle"])
         handle = feed_cfg.get("handle")
         if handle:
             cookie = (self.config.get("x") or {}).get("auth_token", "")
@@ -292,8 +347,13 @@ class Monitor:
                 body = translate_for_push(body, engine=self.config.get("translate_engine", "llm"))
             except Exception as e:
                 logging.warning("翻译模块异常（跳过翻译）: %s", e)
+        # Telegram 频道用独立模板（带 (@author) 供 relay 订阅匹配）；
+        # feed 级 template 优先，其次 telegram.template，最后全局 template。
+        tpl = (feed_cfg or {}).get("template")
+        if not tpl and (feed_cfg or {}).get("source") == "telegram":
+            tpl = (self.config.get("telegram") or {}).get("template")
         text = format_message(
-            self.config["template"],
+            tpl or self.config["template"],
             name=name, author=t["author"], text=body, link=t["link"], time=tstr,
         )
         images = (
@@ -311,7 +371,10 @@ class Monitor:
                 logging.warning("[%s] %s 的 GIF 生成全部失败，改为附带视频直链",
                                 name, t["id"])
         try:
-            ok_groups, failed = self.bot.send_post(groups, text, images, video_paths, at_all=at_all)
+            # 与「其它源 / 手动补推」互斥，保证 text → 图片 1..N 连续发完再让位。
+            with self._push_lock:
+                ok_groups, failed = self.bot.send_post(
+                    groups, text, images, video_paths, at_all=at_all)
             for f in failed:
                 logging.warning("[%s] 群 %s 未送达: %s", name, f["group_id"], f["error"])
             self.store.mark(url, t["id"])
@@ -332,7 +395,7 @@ class Monitor:
         if not tweets:
             return 0
 
-        url = feed_cfg["url"] if feed_cfg.get("url") else f"x://{feed_cfg['handle']}"
+        url = feed_url(feed_cfg)
         # 与手动回推互斥：该博主正在回推时本轮跳过，避免双通道同时推送
         with self.lock:
             if url in self._busy_urls:
@@ -346,70 +409,36 @@ class Monitor:
                 self._busy_urls.discard(url)
 
     def _do_process_feed(self, url: str, name: str, tweets: list, feed_cfg: dict) -> int:
-        known = self.store.known_ids(url)
+        """常规轮询：所有防刷屏判定统一交给 PushGuard，这里只负责落库与发送。"""
         groups = feed_cfg.get("groups") or self.config["qq"]["groups"]  # 博主专属群优先
         if not groups:
             logging.warning("[%s] 未配置目标群（博主专属群和全局默认群都为空），本轮只记录不推送", name)
             for t in tweets:
                 self.store.mark(url, t["id"])
             return 0
-        # 首次运行且未开 backfill：只记录历史，不刷屏
-        if not known and not self.config.get("backfill", False):
-            for t in tweets:
-                self.store.mark(url, t["id"])
-            logging.info("首次运行 [%s]：记录 %d 条历史推文（不推送）", name, len(tweets))
-            return 0
-        # 首次运行且开了 backfill：同样只推时间窗口内的（无时间戳的一律只记录）
-        if not known:
-            hours = int(self.config.get("backfill_hours", 24))
-            cutoff = time.time() - hours * 3600
-            sent = 0
-            for t in reversed(tweets):
-                if not t.get("ts") or t["ts"] < cutoff:
-                    self.store.mark(url, t["id"])
-                    continue
-                if self._push_one(url, name, t, groups, feed_cfg):
-                    sent += 1
-            logging.info("首次运行 [%s]（backfill 开）：推送近 %d 小时 %d 条", name, hours, sent)
-            return sent
-
-        # 常规轮询：双重防刷屏
-        # 1) 时间窗：只推 max_push_age_hours 内的新推文，更早的积压（如曾因禁言/掉线
-        #    发送失败而未标记的旧推文）直接标记跳过，不再补发
-        # 2) 单轮上限：每源每轮最多推 max_push_per_cycle 条，超出留到下一轮
-        max_age_hours = float(self.config.get("max_push_age_hours", 2))
-        cutoff = time.time() - max_age_hours * 3600
-        cap = int(self.config.get("max_push_per_cycle", 5))
+        d = self.guard.select(url, tweets)
+        for t in d.to_mark:
+            self.store.mark(url, t["id"])
         sent = 0
-        skipped_old = 0
-        for t in reversed(tweets):  # 从旧到新
-            if t["id"] in known:
-                continue
-            if not t.get("ts"):
-                # 无时间戳无法判断新旧，保守起见只标记不推送（避免老旧内容涌入刷屏）
-                self.store.mark(url, t["id"])
-                skipped_old += 1
-                continue
-            if t["ts"] < cutoff:
-                self.store.mark(url, t["id"])
-                skipped_old += 1
-                continue
-            if sent >= cap:
-                logging.info("[%s] 本轮已达单轮推送上限 %d 条，其余留待下轮", name, cap)
-                break
+        for t in d.to_push:
             if self._push_one(url, name, t, groups, feed_cfg):
                 sent += 1
-        if skipped_old:
-            logging.info("[%s] 跳过 %d 条超出 %.1f 小时时间窗/无时间戳的推文（只标记不补发）",
-                         name, skipped_old, max_age_hours)
+        logging.info("[%s] %s；实际发送 %d 条", name, d.reason, sent)
         return sent
 
-    def backfill_feed(self, feed_cfg: dict, hours: int = None) -> int:
-        """回推最近 hours 小时的推文（供测试）；小时数默认取配置 backfill_hours"""
+    def backfill_feed(self, feed_cfg: dict, hours: int = None,
+                      force: bool = False) -> int:
+        """回测：补推近 hours 小时内「漏掉」的内容，不破坏去重水位线。
+
+        与旧实现的关键区别：**不再清空去重记录**。旧版调用方先 clear_feed()
+        再回推，等于把水位线抹掉，时间线里更老的内容会在下一轮常规轮询里
+        被重新当成新内容补发 —— 这正是反复刷屏的来源。
+        force=True 才允许重发已推过的，且受 PushGuard 冷却与条数上限约束。
+        """
         if hours is None:
             hours = int(self.config.get("backfill_hours", 24))
         name = feed_cfg.get("name", feed_cfg.get("handle") or feed_cfg.get("url", "?"))
-        url = feed_cfg.get("url") or f"x://{feed_cfg.get('handle')}"
+        url = feed_url(feed_cfg)
         with self.lock:
             if url in self._busy_urls:
                 logging.info("回推 [%s] 跳过：该博主正在常规检查中", name)
@@ -417,26 +446,19 @@ class Monitor:
             self._busy_urls.add(url)
         try:
             tweets = self._fetch_tweets(feed_cfg)
-            cutoff = time.time() - hours * 3600
-            known = self.store.known_ids(url)
             groups = feed_cfg.get("groups") or self.config["qq"]["groups"]
             if not groups:
                 logging.warning("回推 [%s] 跳过：未指定目标群（博主专属群和全局默认群都为空）", name)
                 return 0
-            # 严格按时间窗口：没有时间戳的推文一律不回推（避免混入老旧内容）
-            recent = [t for t in tweets if t.get("ts") and t["ts"] >= cutoff]
-            no_ts = sum(1 for t in tweets if not t.get("ts"))
-            if no_ts:
-                logging.info("回推 [%s]：跳过 %d 条无时间戳的推文", name, no_ts)
-            logging.info("回推 [%s]：近 %d 小时 %d 条（时间线共 %d 条）",
-                         name, hours, len(recent), len(tweets))
+            d = self.guard.select(url, tweets, replay=True, hours=hours, force=force)
+            for t in d.to_mark:
+                self.store.mark(url, t["id"])
             sent = 0
-            for t in reversed(recent):  # 从旧到新
-                if t["id"] in known:
-                    continue
+            for t in d.to_push:
                 if self._push_one(url, name, t, groups, feed_cfg):
                     sent += 1
-            logging.info("回推 [%s] 完成：成功推送 %d 条到群 %s", name, sent, groups)
+            logging.info("回推 [%s] 完成：%s；成功推送 %d 条到群 %s",
+                         name, d.reason, sent, groups)
             return sent
         finally:
             with self.lock:
@@ -446,15 +468,15 @@ class Monitor:
     def _fast_tick(self, poll_seconds: int):
         """快速轮询的一次心跳：挑出最久没抓的博主，超过 poll_seconds 就抓它。
         每次只抓一个源（错峰），避免同一时刻并发请求 X 接口触发限频。"""
-        feeds = self.config.get("twitter", {}).get("feeds", [])
+        feeds = iter_feeds(self.config)
         if not feeds:
             return
         candidates = sorted(
-            ((self._last_fetch.get(fc.get("url") or f"x://{fc.get('handle')}", 0), fc) for fc in feeds),
+            ((self._last_fetch.get(feed_url(fc), 0), fc) for fc in feeds),
             key=lambda x: x[0],
         )
         oldest_ts, feed_cfg = candidates[0]
-        url = feed_cfg.get("url") or f"x://{feed_cfg.get('handle')}"
+        url = feed_url(feed_cfg)
         if time.time() - oldest_ts < poll_seconds:
             return  # 全部源都还新鲜
         with self.lock:
