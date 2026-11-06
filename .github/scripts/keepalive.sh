@@ -23,7 +23,7 @@ WF_PATH=".github/workflows/keepalive.yml"
 WF_ID_DEFAULT="408910876"
 
 END=$((SECONDS + 21000))          # 350 min, below the 358 min job timeout
-RELAY_EVERY=$((90 * 60))          # hand over every 90 minutes
+RELAY_EVERY=$((1 * 60))           # TEMP: accelerated relay verification
 NEXT_RELAY=$((SECONDS + RELAY_EVERY))
 
 i=0
