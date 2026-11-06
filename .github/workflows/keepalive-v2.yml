@@ -1,0 +1,9 @@
+name: tw2qq 24x7 keepalive
+on:
+  schedule: [{cron: '0 */6 * * *'}]
+  push: {branches: [main]}
+  workflow_dispatch:
+concurrency: {group: tw2qq-keepalive, cancel-in-progress: true}
+permissions: {contents: read}
+jobs:
+  heartbeat: {runs-on: ubuntu-latest, timeout-minutes: 358, steps: [{uses: actions/checkout@v4}, {run: bash .github/scripts/keepalive.sh}]}
