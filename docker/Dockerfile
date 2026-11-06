@@ -15,9 +15,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY docker/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
 COPY app/ /app/
 COPY docker/config.docker.yaml /app/config.yaml
-RUN pip install --no-cache-dir -r docker/requirements.txt
 
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && mkdir -p /app/persist/home /app/data /app/logs
