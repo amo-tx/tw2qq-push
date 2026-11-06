@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>twitter2qq 控制台</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --panel2: #1d212e; --border: #2a2f3e;
+    --text: #e2e6f0; --muted: #8b93a7; --accent: #4f8cff; --green: #34d17b;
+    --red: #ff5c6c; --yellow: #f0b429; --mono: "Cascadia Code", Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.6 "Segoe UI", "Microsoft YaHei", sans-serif; padding: 16px 20px; }
+
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  h1 { font-size: 19px; margin-right: 8px; }
+  .badge { padding: 3px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+  .badge.on  { background: rgba(52,209,123,.15); color: var(--green); border: 1px solid rgba(52,209,123,.4); }
+  .badge.off { background: rgba(255,92,108,.15); color: var(--red); border: 1px solid rgba(255,92,108,.4); }
+  .badge.warn{ background: rgba(240,180,41,.15); color: var(--yellow); border: 1px solid rgba(240,180,41,.4); }
+  .spacer { flex: 1; }
+  button { background: var(--accent); color: #fff; border: none; padding: 8px 18px;
+    border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  button:hover { filter: brightness(1.15); }
+  button.ghost { background: var(--panel2); border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: transparent; border: 1px solid var(--red); color: var(--red); padding: 4px 10px; font-size: 12px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  input[type=text] {
+    background: #0c0e14; border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 8px 12px; font-size: 13px; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  label.chk { color: var(--muted); font-size: 13px; margin-right: 10px; cursor: pointer; }
+
+  nav { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; flex-wrap: wrap; }
+  nav button { background: transparent; border: none; color: var(--muted); border-radius: 8px 8px 0 0;
+    padding: 9px 18px; font-weight: 600; }
+  nav button.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+  .tab { display: none; } .tab.active { display: block; }
+
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px; }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 24px; font-weight: 700; margin-top: 2px; }
+  .card .value small { font-size: 13px; color: var(--muted); font-weight: 400; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 14px; color: var(--muted); font-weight: 600; margin-bottom: 12px; letter-spacing: .5px; }
+  .row2 { display: grid; grid-template-columns: 1fr 1.4fr; gap: 12px; }
+  @media (max-width: 900px) { .row2 { grid-template-columns: 1fr; } }
+  .hint { color: var(--muted); font-size: 12.5px; line-height: 1.8; }
+  .hint b { color: var(--text); }
+
+  .bars { display: flex; align-items: flex-end; gap: 10px; height: 130px; padding-top: 8px; }
+  .bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
+  .bar { width: 60%; max-width: 44px; background: linear-gradient(180deg, #5b9bff, #2f6ae0); border-radius: 6px 6px 2px 2px; min-height: 3px; transition: height .4s; }
+  .bar-num { font-size: 11px; color: var(--muted); }
+  .bar-date { font-size: 11px; color: var(--muted); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 6px 8px; border-bottom: 1px solid rgba(42,47,62,.5); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .err { color: var(--red); font-size: 12px; } .okc { color: var(--green); }
+  .dim { color: var(--muted); }
+  .mono { font-family: var(--mono); }
+
+  #logbox, #qrbox {
+    background: #0c0e14; border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px; overflow-y: auto; font-family: var(--mono);
+    font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-all;
+  }
+  #logbox { height: 320px; } #qrbox { min-height: 120px; font-size: 8px; line-height: 1.05; letter-spacing: 0; }
+  #cfgbox {
+    width: 100%; min-height: 300px; background: #0c0e14; color: var(--text);
+    border: 1px solid var(--border); border-radius: 10px; padding: 12px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.6; resize: vertical;
+  }
+  .toast { position: fixed; top: 20px; right: 20px; padding: 10px 20px; border-radius: 10px;
+    background: var(--panel2); border: 1px solid var(--border); display: none; z-index: 99; max-width: 420px; }
+  .toast.ok { border-color: var(--green); } .toast.bad { border-color: var(--red); }
+  .preview-item { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 12.5px; }
+  .chat-card { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+  .chip { display: inline-flex; align-items: center; gap: 7px; background: rgba(79,140,255,.12); border: 1px solid rgba(79,140,255,.35);
+    color: var(--accent); border-radius: 14px; padding: 2px 11px; font-size: 12px; margin: 2px 8px 2px 0; }
+  .chip a { cursor: pointer; color: var(--red); text-decoration: none; font-weight: 700; }
+  .chip a:hover { filter: brightness(1.3); }
+  select { background: #0c0e14; border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 7px 10px; font-size: 13px; }
+  .flex { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🐦 twitter2qq</h1>
+  <span id="badge-polling" class="badge off">轮询未启动</span>
+  <span id="badge-bot" class="badge off">QQ 未连接</span>
+  <span id="badge-x" class="badge off">X 未登录</span>
+  <span class="spacer"></span>
+  <label class="chk" style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:13px" title="推送推文时 @全体成员（需要机器人为群管理员；普通群有次数限制）">
+    <input type="checkbox" id="chk-atall" onchange="toggleAtAll(this.checked)"> @全体
+  </label>
+  <button id="btn-check" onclick="doCheck()">立即检查</button>
+  <button id="btn-toggle" class="ghost" onclick="togglePolling()">暂停轮询</button>
+</header>
+
+<nav>
+  <button class="active" data-tab="overview" onclick="switchTab('overview')">总览</button>
+  <button data-tab="feeds" onclick="switchTab('feeds')">博主管理</button>
+  <button data-tab="chats" onclick="switchTab('chats')">推送目标</button>
+  <button data-tab="qq" onclick="switchTab('qq')">QQ 登录</button>
+  <button data-tab="x" onclick="switchTab('x')">X 账号</button>
+  <button data-tab="net" onclick="switchTab('net')">网络</button>
+  <button data-tab="logs" onclick="switchTab('logs')">日志</button>
+  <button data-tab="config" onclick="switchTab('config')">配置</button>
+</nav>
+
+<!-- ============ 总览 ============ -->
+<div class="tab active" id="tab-overview">
+  <div class="grid">
+    <div class="card"><div class="label">累计推送</div><div class="value" id="st-total">-<small> 条</small></div></div>
+    <div class="card"><div class="label">监听博主</div><div class="value" id="st-feeds">-<small> 个</small></div></div>
+    <div class="card"><div class="label">目标群</div><div class="value" id="st-groups">-<small> 个</small></div></div>
+    <div class="card"><div class="label">上次检查</div><div class="value" style="font-size:16px" id="st-last">-</div></div>
+    <div class="card"><div class="label">防刷屏拦截</div><div class="value" id="st-guard" title="启动后拦下的历史/超窗/超限推文">-<small> 条</small></div></div>
+  </div>
+  <div class="row2">
+    <div class="panel"><h2>近 7 日推送量</h2><div class="bars" id="bars"></div></div>
+    <div class="panel"><h2>博主状态</h2>
+      <table id="tbl-feeds"><thead><tr><th>博主</th><th>推送到</th><th>最近成功</th><th>最近错误</th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+  <div class="panel"><h2>最近推送（新 → 旧）</h2>
+    <table id="tbl-history"><thead><tr><th>时间</th><th>博主</th><th>作者</th><th>内容摘要</th><th>媒体</th><th>群</th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<!-- ============ 博主管理 ============ -->
+<div class="tab" id="tab-feeds">
+  <div class="panel">
+    <h2>添加博主</h2>
+    <div class="flex">
+      <select id="in-source" onchange="onSourceChange()" style="width:135px">
+        <option value="x">X / Twitter</option>
+        <option value="telegram">Telegram 频道</option>
+      </select>
+      <input type="text" id="in-handle" placeholder="X 用户名，如 elonmusk" style="width:220px">
+      <input type="text" id="in-name" placeholder="显示名（可选）" style="width:160px">
+      <button onclick="previewFeed()">🔍 预览最新推文</button>
+      <span id="preview-groups"></span>
+      <button onclick="addFeed()">＋ 添加关注</button>
+    </div>
+    <div id="preview-box"></div>
+    <div class="hint">提示：Telegram 只支持公开频道（填频道用户名，可贴 t.me 链接），走云端代理读取公开预览页；X 预览需要能访问 x.com。添加后<b>不会</b>自动补发历史内容，新内容会在下一轮轮询推送；如需补推漏发请点下方「补推漏发」。</div>
+  </div>
+  <div class="panel">
+    <h2>从 X 账号导入关注列表</h2>
+    <div class="flex">
+      <button id="btn-following" onclick="loadFollowing()">📖 读取我的关注列表</button>
+      <input type="text" id="in-following-search" placeholder="筛选用户名/昵称…" style="width:200px" oninput="renderFollowing()">
+      <button onclick="addSelectedFollowing()">✓ 添加勾选的博主</button>
+      <span class="dim" id="following-count"></span>
+    </div>
+    <div id="following-box" style="max-height:340px;overflow-y:auto"></div>
+    <div class="hint" style="margin-top:8px">读取的是当前 auth_token 账号的全部关注（最多约 500 个）。勾选后点「添加勾选的博主」即可批量导入，已添加过的会标灰。</div>
+  </div>
+  <div class="panel"><h2>关注列表</h2>
+    <table id="tbl-manage"><thead><tr><th>显示名</th><th>来源</th><th>目标群</th><th></th></tr></thead><tbody></tbody></table>
+  </div>
+</div>
+
+<!-- ============ 推送目标 ============ -->
+<div class="tab" id="tab-chats">
+  <div class="panel">
+    <h2>推送目标管理（每个群聊各自关注哪些博主）</h2>
+    <div class="hint" id="chats-state" style="margin-bottom:12px"></div>
+    <div id="relay-target" style="margin-bottom:12px"></div>
+    <div id="chat-list"></div>
+    <div class="hint" style="margin-top:12px">
+      <b>规则：</b>「全局默认群」会接收所有<b>未单独指定群</b>的博主内容；某博主一旦绑定了群，就只推到绑定的群。<br>
+      群列表从 QQ 实时拉取（机器人需已入群）。「博主管理」页添加博主时也可直接勾选目标群。
+    </div>
+  </div>
+</div>
+
+<!-- ============ QQ 登录 ============ -->
+<div class="tab" id="tab-qq">
+  <div class="row2">
+    <div class="panel">
+      <h2>NapCat 登录 QQ</h2>
+      <div class="flex">
+        <span id="qq-installed" class="badge off">未安装</span>
+        <span id="qq-status" class="badge off">未运行</span>
+      </div>
+      <div class="flex">
+        <input type="text" id="in-qq" placeholder="要登录的 QQ 号" style="width:180px">
+        <button onclick="qqStart()">启动并扫码</button>
+        <button class="ghost" onclick="qqStop()">停止</button>
+      </div>
+      <div class="flex">
+        <button class="ghost" id="btn-napcat-dl" onclick="qqDownload()">下载安装 NapCat.Shell</button>
+        <span class="dim mono" id="qq-dir" style="font-size:11px"></span>
+      </div>
+      <div class="hint" id="qq-dl-msg"></div>
+      <div class="hint" id="qq-webui"></div>
+      <div class="hint" id="qq-logtail"></div>
+      <div class="hint" style="margin-top:8px">
+        <b>流程：</b>下载安装 → 输入 QQ 号 → 用手机 QQ 扫右侧二维码 → 显示在线即成功。<br>
+        NapCat 需要本机装有 NTQQ 版 QQ 客户端；首次登录后下次通常免扫码。<br>
+        <b>备用通道：</b>也可自行运行 NapCat（自带 WebUI :6099），只要它的 OneBot HTTP
+        Server 监听 127.0.0.1:3000，本程序即可直连（token 在「配置」页设置）。
+      </div>
+    </div>
+    <div class="panel"><h2>登录二维码</h2><div id="qrbox">（启动后显示二维码字符画，用手机 QQ 扫一扫）</div></div>
+  </div>
+</div>
+
+<!-- ============ X 账号 ============ -->
+<div class="tab" id="tab-x">
+  <div class="panel">
+    <h2>X（推特）账号登录</h2>
+    <div class="hint" style="margin-bottom:10px">
+      1. 用浏览器登录 <span class="mono">x.com</span>（建议专用小号）<br>
+      2. 按 <b>F12</b> → <b>应用/Application</b> → <b>Cookie</b> → <span class="mono">https://x.com</span><br>
+      3. 找到 <span class="mono">auth_token</span>，复制它的值粘贴到下面
+    </div>
+    <div class="flex">
+      <input type="text" id="in-token" placeholder="粘贴 auth_token 的值" style="width:420px" class="mono">
+      <button onclick="validateX()">验证并保存</button>
+      <span id="x-state"></span>
+    </div>
+    <div class="hint" id="x-hint"></div>
+    <div class="hint" style="margin-top:8px">说明：不登录也能添加博主（走公开接口，频控较严）；登录后走账号会话，更稳、内容更全。Cookie 属敏感凭据，仅保存在本机 config.yaml。</div>
+  </div>
+</div>
+
+<!-- ============ 网络加速 ============ -->
+<div class="tab" id="tab-net">
+  <div class="panel">
+    <h2>ChromeGo 内置加速（程序内启动，无需单独开 ChromeGo）</h2>
+    <div class="hint" style="margin-bottom:10px">
+      直接在本程序里启动 ChromeGo 的代理内核：<b>只有本程序的流量</b>（x.com / GitHub 下载）走加速，
+      不修改系统代理、不影响浏览器和其他软件；QQ 群转发始终直连。
+    </div>
+    <div class="flex">
+      <select id="sel-kernel" style="width:280px"></select>
+      <button onclick="cgStart()">启动内核并接管加速</button>
+      <button class="ghost" onclick="cgStop()">停止内核</button>
+      <span id="cg-state"></span>
+    </div>
+    <div class="hint" id="cg-detail" style="margin-top:6px"></div>
+    <div class="flex" style="margin-top:8px">
+      <input type="text" id="in-cgdir" style="width:420px" class="mono" placeholder="ChromeGo 目录路径">
+      <button class="ghost" onclick="cgSaveDir()">保存 ChromeGo 路径</button>
+    </div>
+    <hr style="border-color:#333;border-style:solid;margin:14px 0">
+    <h2>手动代理（可选，用外部代理工具时才需要填）</h2>
+    <div class="hint" style="margin-bottom:10px">
+      x.com 与 GitHub 的下载默认<b>不走系统代理</b>，直连会超时。这里填入本地代理端口后，
+      所有外网请求将统一走该通道。<br>
+      · ChromeGo <b>clash.meta</b> 内核：<span class="mono">127.0.0.1:7890</span>
+      &nbsp;· Xray / hysteria / sing-box / naive 等内核：<span class="mono">127.0.0.1:1080</span><br>
+      · Watt Toolkit 加速 GitHub 无需填这里（程序已兼容其证书）；它只加速 GitHub，管不到 x.com
+    </div>
+    <div class="flex">
+      <input type="text" id="in-proxy" placeholder="例如 127.0.0.1:7890（留空=直连）" style="width:340px" class="mono">
+      <button onclick="saveProxy()">保存并生效</button>
+      <button class="ghost" onclick="detectProxy()">自动检测本机代理端口</button>
+      <button class="ghost" onclick="testProxy()">连通性测试</button>
+    </div>
+    <div class="hint" id="net-detected"></div>
+    <div class="hint" id="net-test" style="margin-top:6px"></div>
+    <div class="hint" style="margin-top:8px">当前生效：<span class="mono" id="net-active">—</span>
+      （NapCat 等本地地址始终直连，不受代理影响）</div>
+  </div>
+</div>
+
+<!-- ============ 日志 ============ -->
+<div class="tab" id="tab-logs">
+  <div class="panel"><h2>实时日志</h2><div id="logbox"></div></div>
+</div>
+
+<!-- ============ 配置 ============ -->
+<div class="tab" id="tab-config">
+  <div class="panel">
+    <h2>配置编辑（config.yaml · 保存后自动重载）</h2>
+    <textarea id="cfgbox" spellcheck="false"></textarea>
+    <div style="margin-top:10px; display:flex; gap:10px; align-items:center;">
+      <button onclick="saveConfig()">保存配置</button>
+      <button class="ghost" onclick="loadConfig()">放弃修改</button>
+      <span class="dim" id="cfg-msg"></span>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function toast(msg, ok = true) {
+  const t = $('toast');
+  t.textContent = msg; t.className = 'toast ' + (ok ? 'ok' : 'bad');
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3500);
+}
+async function jget(url) { const r = await fetch(url); return r.json(); }
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  $('tab-' + name).classList.add('active');
+  if (name === 'config') loadConfig();
+  if (name === 'qq') refreshQQ();
+  if (name === 'x') refreshX();
+  if (name === 'feeds') refreshManage();
+  if (name === 'chats') refreshChats();
+  if (name === 'net') { refreshNet(); refreshCG(); }
+}
+
+/* ---------- 推送目标（按群管理博主） ---------- */
+let CHATS = null;
+async function refreshChats() {
+  let s;
+  try { s = await jget('/api/chats'); } catch (e) { return; }
+  CHATS = s;
+  const st = $('chats-state');
+  if (s.error || !s.bot_online) {
+    st.innerHTML = `<span class="err">无法从 QQ 获取群列表${s.error ? '：' + esc(s.error) : ''}</span><br>` +
+      '<span class="dim">请确认「QQ 登录」页状态为在线（顶部 QQ 徽标变绿，即 OneBot :3000 已连通）。</span>';
+  } else if (!s.chats.length) {
+    st.innerHTML = '<span class="dim">机器人还没有加入任何群聊——先把机器人 QQ 拉进目标群。</span>';
+  } else {
+    st.innerHTML = `<span class="okc">✓ 已连接 QQ，获取到 ${s.chats.length} 个群</span>`;
+  }
+  $('chat-list').innerHTML = s.chats.map(c => {
+    const boundKeys = c.feeds.map(f => f.key);
+    const avail = s.feeds.map((f, i) => ({...f, i})).filter(f => !boundKeys.includes(f.key));
+    const chips = c.feeds.map(f => {
+      return `<span class="chip">${esc(f.name)}<a onclick="unbindFeed('${esc(String(c.id))}','${esc(f.key)}',${!!c.relay})" title="解绑">×</a></span>`;
+    }).join('');
+    const opts = avail.map(f => `<option value="${f.i}">${esc(f.name)}</option>`).join('');
+    const emptyHint = c.relay
+      ? '<span class="dim" style="font-size:12px">未绑定博主 = 转发全部推文（含图片/GIF）</span>'
+      : '<span class="dim" style="font-size:12px">未绑定专属博主（仅当设为全局默认时才收内容）</span>';
+    return `<div class="chat-card">
+      <div class="flex" style="margin-bottom:8px">
+        <b>${esc(c.name)}</b>
+        <span class="dim mono" style="font-size:12px">${c.id}${c.member_count ? ' · ' + c.member_count + ' 人' : ''}</span>
+        ${c.relay ? '<span class="badge on" style="font-size:11px">小号转发</span>' : ''}
+        ${c.is_global ? '<span class="badge on" style="font-size:11px">全局默认</span>' : ''}
+        ${c.relay
+          ? `<button class="ghost" style="padding:3px 12px;font-size:12px" onclick="relayTarget('remove','${esc(String(c.id))}')">移除转发</button>`
+          : `<button class="ghost" style="padding:3px 12px;font-size:12px" onclick="toggleGlobal(${c.id},${!c.is_global})">${c.is_global ? '取消全局' : '设为全局默认'}</button>`}
+      </div>
+      <div>${chips || emptyHint}</div>
+      ${avail.length ? `<div class="flex" style="margin:10px 0 0">
+        <select id="sel-${c.id}" style="min-width:220px">${opts}</select>
+        <button style="padding:6px 14px;font-size:12px" onclick="bindSel(${c.id},${!!c.relay})">＋ 绑定该博主</button>
+      </div>` : ''}
+    </div>`;
+  }).join('');
+  /* 小号转发管理：在线状态 + 添加转发目标群（各群订阅在下方卡片里单独配置） */
+  const rb = $('relay-target');
+  try {
+    const [rs, rg] = [await jget('/api/relay/status'), await jget('/api/relay/groups')];
+    const tg = (rg && rg.targets) || [];
+    const others = ((rg && rg.groups) || [])
+      .filter(g => !tg.some(t => String(t.group_id) === String(g.group_id)));
+    const on = !rs.need_qrcode && (rs.online || ((rs.forwarder || {}).ws_connected));
+    const offSince = rs.offline_since ? new Date(rs.offline_since * 1000).toLocaleTimeString('zh-CN', {hour12:false}) : '';
+    const tries = rs.auto_recoveries || 0;
+    const offlineWarn = on ? '' : `<div style="margin-top:8px;font-size:12px;line-height:1.7">
+      ⚠ 云端小号已掉线${offSince ? '（始于 ' + offSince + '）' : ''}${tries ? '，已自动快登重试 ' + tries + ' 次' : ''}。
+      期间机器人推文<b>不会</b>转发到小号群；系统会自动尝试快登，若仍提示验证，请打开
+      <a href="/relay-qrcode" target="_blank" rel="noopener">QQ 登录页</a> 用手机 QQ 扫码。
+      恢复在线后会<b>自动补转</b>掉线期间漏掉的推文（按消息 ID 去重，不会重复）。</div>`;
+    if (!tg.length && !others.length) {
+      rb.innerHTML = `<div class="chat-card"><div class="flex" style="margin-bottom:6px">
+        <b>小号转发</b>
+        <span class="badge ${on ? 'on' : 'off'}">${on ? '✓ 转发链在线' : '× 转发链离线'}</span>
+        </div>${offlineWarn}</div>`;
+    }
+    else {
+      const opts = others.map(g =>
+        `<option value="${esc(String(g.group_id))}">${esc(g.group_name || '')} (${esc(String(g.group_id))})</option>`).join('');
+      rb.innerHTML = `<div class="chat-card">
+        <div class="flex" style="margin-bottom:8px">
+          <b>小号转发</b>
+          <span class="badge ${on ? 'on' : 'off'}">${on ? '✓ 转发链在线' : '× 转发链离线'}</span>
+          <span class="dim" style="font-size:12px">小号把机器人推送群的推文转发到下列「小号转发」群，各群订阅独立</span>
+        </div>
+        ${offlineWarn}
+        ${opts ? `<div class="flex" style="margin-top:4px">
+          <select id="sel-relay-add" style="min-width:260px">${opts}</select>
+          <button style="padding:6px 14px;font-size:12px" onclick="relayTarget('add')">＋ 添加转发目标群</button>
+        </div>` : ''}
+      </div>`;
+    }
+  } catch (e) { rb.innerHTML = ''; }
+}
+async function bindFeed(gid, idx, bind, relay) {
+  if (!CHATS || !CHATS.feeds[idx]) return;
+  const r = await fetch('/api/chats/bind', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({group_id: gid, key: CHATS.feeds[idx].key, bind, relay: !!relay})}).then(r => r.json());
+  if (r.ok) { toast(bind ? '已绑定' : '已解绑'); refreshChats(); }
+  else toast(r.error || '操作失败', false);
+}
+function bindSel(gid, relay) {
+  const sel = $('sel-' + gid);
+  if (sel && sel.value !== '') bindFeed(gid, +sel.value, true, relay);
+}
+async function unbindFeed(gid, key, relay) {
+  const r = await fetch('/api/chats/bind', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({group_id: gid, key, bind: false, relay: !!relay})}).then(r => r.json());
+  if (r.ok) { toast('已解绑'); refreshChats(); }
+  else toast(r.error || '操作失败', false);
+}
+async function relayTarget(action, gid) {
+  if (!gid) { const sel = $('sel-relay-add'); gid = sel && sel.value; }
+  if (!gid) return;
+  const r = await fetch('/api/relay/targets', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action, id: gid})}).then(r => r.json());
+  if (r.ok) { toast(action === 'add' ? '已添加转发目标群' : '已移除转发目标群'); refreshChats(); }
+  else toast(r.error || '操作失败', false);
+}
+async function toggleGlobal(gid, bind) {
+  const r = await fetch('/api/chats/bind', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({group_id: gid, key: '__global__', bind})}).then(r => r.json());
+  if (r.ok) { toast(bind ? '已设为全局默认群' : '已取消全局默认'); refreshChats(); renderGroupChecks(); }
+  else toast(r.error || '操作失败', false);
+}
+
+/* ---------- ChromeGo 内置加速 ---------- */
+async function refreshCG() {
+  try {
+    const s = await jget('/api/chromego/status');
+    $('in-cgdir').value = s.dir || '';
+    const sel = $('sel-kernel');
+    sel.innerHTML = s.kernels.map(k =>
+      `<option value="${esc(k.key)}" ${k.running ? 'selected' : ''} ${!k.available ? 'disabled' : ''}>` +
+      `${esc(k.label)} :${k.port}${k.available ? '' : '（未找到）'}${k.running ? ' ●运行中' : ''}</option>`).join('');
+    $('cg-state').innerHTML = s.running
+      ? `<span class="okc">● ${esc(s.kernel)} 运行中 :${s.port}</span>`
+      : '<span class="dim">○ 未启动</span>';
+    $('cg-detail').textContent = s.last_error
+      ? ('上次错误: ' + s.last_error)
+      : (s.running ? ('程序流量已走代理: ' + s.proxy_active) : '');
+  } catch (e) { /* ignore */ }
+}
+async function cgStart() {
+  const kernel = $('sel-kernel').value;
+  if (!kernel) return toast('请先选择内核', false);
+  $('cg-state').textContent = '启动中…（最长约 20 秒）';
+  const r = await fetch('/api/chromego/start', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({kernel})
+  }).then(r => r.json());
+  if (r.ok) {
+    toast(`内核 ${r.kernel} 已启动，程序流量走 127.0.0.1:${r.port}`, true);
+  } else {
+    toast('启动失败: ' + (r.error || ''), false);
+  }
+  refreshCG(); refreshNet();
+}
+async function cgStop() {
+  await fetch('/api/chromego/stop', {method: 'POST'});
+  toast('内核已停止，程序恢复直连', true);
+  refreshCG(); refreshNet();
+}
+async function cgSaveDir() {
+  const r = await fetch('/api/chromego/dir', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({dir: $('in-cgdir').value.trim()})
+  }).then(r => r.json());
+  toast(r.ok ? 'ChromeGo 路径已保存' : ('保存失败: ' + (r.error || '')), r.ok);
+  refreshCG();
+}
+
+/* ---------- 网络加速 ---------- */
+async function refreshNet() {
+  try {
+    const s = await jget('/api/network');
+    $('in-proxy').value = s.proxy || '';
+    $('net-active').textContent = s.active || '直连（未启用代理）';
+    $('net-detected').innerHTML = s.detected && s.detected.length
+      ? '检测到本机代理端口：<span class="mono">' + s.detected.map(esc).join('</span>、<span class="mono">') + '</span>（点击"自动检测"可快速填入）'
+      : '';
+  } catch (e) { /* ignore */ }
+}
+async function saveProxy() {
+  const r = await fetch('/api/network/proxy', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({proxy: $('in-proxy').value.trim()})
+  }).then(r => r.json());
+  toast('代理已保存并生效: ' + (r.active || '直连'), true);
+  refreshNet();
+}
+async function detectProxy() {
+  const s = await jget('/api/network');
+  if (s.detected && s.detected.length) {
+    $('in-proxy').value = s.detected[0];
+    toast('已填入检测到的代理 ' + s.detected[0] + '，点"保存并生效"确认', true);
+  } else {
+    toast('未检测到常见代理端口(7890/1080等)在监听——请先启动 ChromeGo 的代理内核', false);
+  }
+  refreshNet();
+}
+async function testProxy() {
+  $('net-test').textContent = '测试中…（最长约 25 秒）';
+  const proxy = $('in-proxy').value.trim();
+  const r = await fetch('/api/network/test', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({proxy: proxy})
+  }).then(r => r.json());
+  $('net-test').innerHTML = r.results.map(x =>
+    `<div>${x.ok ? '<span class="okc">✓</span>' : '<span style="color:#e06c75">✗</span>'} ${esc(x.target)}：${esc(x.detail)}</div>`).join('');
+}
+
+/* ---------- 总览 ---------- */
+async function refreshStatus() {
+  try {
+    const s = await jget('/api/status');
+    const bp = $('badge-polling');
+    bp.textContent = s.polling ? '轮询运行中' : '轮询已暂停';
+    bp.className = 'badge ' + (s.polling ? 'on' : 'off');
+    $('btn-toggle').textContent = s.polling ? '暂停轮询' : '启动轮询';
+    const bb = $('badge-bot');
+    bb.textContent = s.bot.ok ? `QQ 在线 (${s.bot.info})` : 'QQ 未连接';
+    bb.className = 'badge ' + (s.bot.ok ? 'on' : 'off');
+    $('st-total').innerHTML = s.pushed_total + '<small> 条</small>';
+    $('st-feeds').innerHTML = s.feeds.length + '<small> 个</small>';
+    $('st-groups').innerHTML = s.groups.length + '<small> 个</small>';
+    $('st-last').textContent = s.last_check || '尚未检查';
+    const g = s.push_guard || {}, gs = g.stats || {};
+    const blocked = (gs.blocked_boot || 0) + (gs.blocked_age || 0)
+                  + (gs.blocked_cap || 0) + (gs.blocked_rate || 0) + (gs.primed || 0);
+    $('st-guard').innerHTML = (g.enabled === false ? '已关闭' : blocked)
+      + '<small> 条</small>';
+    $('st-guard').title = g.enabled === false ? '推送闸门未启用'
+      : `启动于 ${g.boot_at || '-'}，已为 ${(g.primed_feeds || []).length} 个源建立基线；`
+        + `启动水位线拦截 ${gs.blocked_boot || 0} 条，放行 ${gs.allowed || 0} 条`;
+    const tb = $('tbl-feeds').querySelector('tbody');
+    tb.innerHTML = s.feeds.map(f => `<tr>
+      <td>${esc(f.name)}<div class="dim" style="font-size:11px">${esc(f.handle ? '@' + f.handle : f.url)}</div></td>
+      <td class="dim">${f.groups && f.groups.length ? f.groups.join(', ') : '全局'}</td>
+      <td>${f.last_ok ? `<span class="okc">✓ ${f.last_ok}</span>` : '<span class="dim">—</span>'}</td>
+      <td>${f.last_error ? `<span class="err">${esc(f.last_error)}</span>` : '<span class="dim">—</span>'}</td>
+    </tr>`).join('') || '<tr><td colspan="4" class="dim">未配置博主</td></tr>';
+  } catch (e) { /* 服务未就绪 */ }
+}
+async function refreshStats() {
+  const s = await jget('/api/stats');
+  const days = [];
+  for (let i = 6; i >= 0; i--) days.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
+  const map = Object.fromEntries(s.by_day.map(x => [x.date, x.count]));
+  const max = Math.max(...days.map(d => map[d] || 0), 1);
+  $('bars').innerHTML = days.map(d => {
+    const c = map[d] || 0;
+    return `<div class="bar-wrap"><div class="bar-num">${c || ''}</div>
+      <div class="bar" style="height:${Math.max(c / max * 100, 2)}%"></div>
+      <div class="bar-date">${d.slice(5)}</div></div>`;
+  }).join('');
+}
+async function refreshHistory() {
+  const rows = await jget('/api/history?limit=30');
+  $('tbl-history').querySelector('tbody').innerHTML = rows.map(h => `<tr>
+    <td class="dim">${esc(h.time)}</td><td>${esc(h.feed)}</td><td>@${esc(h.author || '')}</td>
+    <td>${esc(h.text.slice(0, 80))}${h.text.length > 80 ? '…' : ''}</td>
+    <td class="dim">${h.images || 0}</td><td class="dim">${esc(h.groups)}</td>
+  </tr>`).join('') || '<tr><td colspan="6" class="dim">暂无推送记录</td></tr>';
+}
+
+/* ---------- 博主管理 ---------- */
+function onSourceChange() {
+  const tg = $('in-source').value === 'telegram';
+  $('in-handle').placeholder = tg ? '频道用户名，如 Seele_WW_Leak' : 'X 用户名，如 elonmusk';
+}
+async function previewFeed() {
+  const isTg = $('in-source').value === 'telegram';
+  const handle = $('in-handle').value.trim().replace(/^@/, '');
+  if (!handle) return toast(isTg ? '请输入 Telegram 频道用户名' : '请输入 X 用户名', false);
+  $('preview-box').innerHTML = '<span class="dim">预览中…</span>';
+  if (isTg) {
+    const r = await jget('/api/tg/probe?media=0&handle=' + encodeURIComponent(handle));
+    if (!r.ok) { $('preview-box').innerHTML = `<span class="err">${esc(r.error || '频道不可读')} (HTTP ${r.http_status || '-'})</span>`; return; }
+    $('preview-box').innerHTML = `<b class="okc">${esc(r.channel_title || r.handle)} · 最近 ${r.message_count} 条：</b>` +
+      (r.samples || []).map(t => `<div class="preview-item">${esc(t.text || '(无文字)')}${t.images ? ` <span class="dim">[图${t.images}]</span>` : ''}${t.videos ? ` <span class="dim">[视频${t.videos}]</span>` : ''}</div>`).join('');
+    return;
+  }
+  const r = await jget('/api/x/preview?handle=' + encodeURIComponent(handle));
+  if (!r.ok) { $('preview-box').innerHTML = `<span class="err">${esc(r.error)}</span>`; return; }
+  $('preview-box').innerHTML = `<b class="okc">@${esc(r.handle)} 最新 ${r.tweets.length} 条：</b>` +
+    r.tweets.map(t => `<div class="preview-item">${esc(t.text)}${t.images ? ` <span class="dim">[图${t.images}]</span>` : ''}${t.videos ? ` <span class="dim">[视频${t.videos}]</span>` : ''}</div>`).join('');
+}
+async function renderGroupChecks() {
+  const s = await jget('/api/status');
+  $('preview-groups').innerHTML = '推送到：' + (s.groups.map(g =>
+    `<label class="chk"><input type="checkbox" value="${g}" class="gchk"> ${g}</label>`).join('') ||
+    '<span class="err">先在配置页设置全局群号</span>');
+}
+async function addFeed() {
+  const source = $('in-source').value;
+  const handle = $('in-handle').value.trim().replace(/^@/, '');
+  if (!handle) return toast(source === 'telegram' ? '请输入 Telegram 频道用户名' : '请输入 X 用户名', false);
+  const groups = [...document.querySelectorAll('.gchk:checked')].map(c => +c.value);
+  const r = await fetch('/api/feeds', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({handle, name: $('in-name').value.trim() || undefined, groups, source})
+  }).then(r => r.json());
+  if (r.ok) {
+    $('in-handle').value = ''; $('in-name').value = ''; $('preview-box').innerHTML = '';
+    const label = (source === 'telegram' ? 'TG 频道 ' : '@') + handle;
+    toast(r.backfill ? `已添加 ${label}，正在补推近 ${r.hours || 24} 小时内漏掉的内容`
+                     : '已添加 ' + label + '（不会自动补发历史推文）', true);
+    refreshManage(); refreshStatus(); refreshChats();
+  }
+  else toast(r.error, false);
+}
+async function refreshManage() {
+  const feeds = await jget('/api/feeds');
+  $('tbl-manage').querySelector('tbody').innerHTML = feeds.map(f => {
+    const key = f.handle || f.url || '';
+    return `<tr>
+      <td>${esc(f.name)}</td>
+      <td class="dim mono">${f.source === 'telegram' ? 'TG · ' : '@'}${esc(f.handle || f.url || '')}</td>
+      <td class="dim">${f.groups && f.groups.length ? f.groups.join(', ') : '全局'}</td>
+      <td>
+        <button onclick="rebackfill('${esc(key).replace(/'/g, '&#39;')}')">↻ 补推漏发</button>
+        <button class="danger" onclick="delFeed('${esc(key).replace(/'/g, '&#39;')}')">取关</button>
+      </td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="4" class="dim">暂无关注，去上方添加</td></tr>';
+}
+async function rebackfill(key) {
+  if (!confirm('补推 ' + key + ' 近 24 小时内「漏掉」的推文？\n已推送过的内容不会重发，也不会清空去重记录。')) return;
+  const r = await fetch('/api/feeds/backfill', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key})}).then(r => r.json());
+  if (r.ok) toast(`正在补推近 ${r.hours || 24} 小时内漏掉的推文（不重发历史）…`, true);
+  else toast(r.error || '补推失败（QQ 未在线？）', false);
+}
+async function delFeed(key) {  if (!confirm('确认取关 ' + key + ' ？')) return;
+  await fetch('/api/feeds', {method: 'DELETE', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key})});
+  refreshManage(); refreshStatus();
+}
+
+/* ---------- 导入 X 关注列表 ---------- */
+let FOLLOWING = [];
+async function loadFollowing() {
+  const btn = $('btn-following');
+  btn.disabled = true; btn.textContent = '读取中…（约 10-40 秒）';
+  $('following-box').innerHTML = '<span class="dim">正在从 x.com 读取关注列表…</span>';
+  try {
+    const r = await jget('/api/x/following');
+    if (!r.ok) {
+      $('following-box').innerHTML = `<span class="err">${esc(r.error)}</span>`;
+      toast(r.error, false);
+    } else {
+      FOLLOWING = r.users;
+      FOLLOWING._existing = r.existing || [];
+      $('following-count').textContent = `共 ${r.users.length} 个关注`;
+      renderFollowing();
+      toast(`已读取 ${r.users.length} 个关注，勾选后批量添加`, true);
+    }
+  } catch (e) {
+    $('following-box').innerHTML = `<span class="err">请求失败：${esc(String(e))}</span>`;
+  }
+  btn.disabled = false; btn.textContent = '📖 读取我的关注列表';
+}
+function renderFollowing() {
+  const kw = ($('in-following-search').value || '').trim().toLowerCase();
+  const list = FOLLOWING.filter(u =>
+    !kw || u.handle.toLowerCase().includes(kw) || (u.name || '').toLowerCase().includes(kw));
+  $('following-box').innerHTML = list.map(u => {
+    const added = (FOLLOWING._existing || []).includes(u.handle.toLowerCase());
+    return `<div class="preview-item" style="display:flex;align-items:center;gap:10px">
+      <input type="checkbox" class="fchk" data-handle="${esc(u.handle)}" data-name="${esc(u.name)}" ${added ? 'disabled' : ''}>
+      ${u.avatar ? `<img src="${esc(u.avatar)}" style="width:24px;height:24px;border-radius:50%">` : ''}
+      <b>${esc(u.name)}</b>
+      <span class="dim mono">@${esc(u.handle)}</span>
+      ${added ? '<span class="dim" style="font-size:12px">✓ 已在关注列表</span>' : ''}
+    </div>`;
+  }).join('') || '<span class="dim">无匹配项</span>';
+}
+async function addSelectedFollowing() {
+  const checked = [...document.querySelectorAll('.fchk:checked')];
+  if (!checked.length) return toast('请先勾选要添加的博主', false);
+  let ok = 0, fail = 0, bf = 0, hours = 24;
+  for (const c of checked) {
+    const r = await fetch('/api/feeds', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({handle: c.dataset.handle, name: c.dataset.name})}).then(r => r.json());
+    if (r.ok) { ok++; if (r.backfill) { bf++; hours = r.hours || 24; } FOLLOWING._existing.push(c.dataset.handle.toLowerCase()); }
+    else fail++;
+  }
+  toast(`批量添加完成：成功 ${ok} 个（不会自动补发历史）${fail ? `，失败 ${fail} 个` : ''}`, fail === 0);
+  renderFollowing(); refreshManage(); refreshStatus();
+}
+
+/* ---------- QQ 登录 ---------- */
+async function refreshQQ() {
+  const s = await jget('/api/qq/status');
+  // 预填上次登录保存的 QQ 号（不用每次重新输入）
+  if (s.qq && !$('in-qq').value.trim()) $('in-qq').value = s.qq;
+  const bi = $('qq-installed');
+  bi.textContent = s.installed ? 'NapCat 已安装' : 'NapCat 未安装';
+  bi.className = 'badge ' + (s.installed ? 'on' : 'off');
+  const bs = $('qq-status');
+  const map = {online: ['在线', 'on'], wait_qr: ['等待扫码', 'warn'], starting: ['启动中', 'warn'],
+               reconnecting: ['掉线·自动重连中', 'warn'], offline: ['已掉线·等待重连', 'warn'],
+               error: ['异常', 'off'], stopped: ['未运行', 'off']};
+  let st = map[s.status] || map.stopped;
+  if (s.status === 'wait_qr' && s.dropped_from_online)
+    st = [s.drop_reconnects > 0 ? `掉线·自动恢复中(第${s.drop_reconnects}次)` : '掉线·自动恢复中', 'warn'];
+  if (s.status === 'online' && s.reconnects > 0) st = [`在线（已自动重连${s.reconnects}次）`, 'on'];
+  bs.textContent = st[0]; bs.className = 'badge ' + st[1];
+  $('qq-dir').textContent = s.dir;
+  $('qq-webui').innerHTML = s.webui_url ? `NapCat WebUI: <a href="${esc(s.webui_url)}">${esc(s.webui_url)}</a>` : '';
+  if (!$('qq-conflict')) {
+    const d = document.createElement('div');
+    d.id = 'qq-conflict';
+    d.style.cssText = 'display:none;margin-top:8px;padding:8px 10px;border:1px solid #e5c07b;color:#e5c07b;border-radius:6px;font-size:12px;line-height:1.6';
+    $('qq-logtail').parentNode.insertBefore(d, $('qq-logtail'));
+  }
+  const qqconflict = $('qq-conflict');
+  if (s.external && s.status !== 'online') {
+    qqconflict.innerHTML = '📱 安卓外部模式：NapCat 运行在 proot 容器中，由系统/脚本自行管理。'
+      + '请打开 <a href="http://127.0.0.1:6099" target="_blank">NapCat WebUI (127.0.0.1:6099)</a> 启动并扫码登录，'
+      + '本程序每 30 秒自动探测连接状态。若容器被系统杀掉，请重新运行 android/start.sh';
+    qqconflict.style.display = '';
+  } else if (s.hint) {
+    qqconflict.innerHTML = '⚠ ' + esc(s.hint);
+    qqconflict.style.display = '';
+  } else if (s.official_qq_running && s.status !== 'online') {
+    qqconflict.innerHTML = '⚠ 检测到官方 QQ 正在运行：若官方 QQ 登录的是<b>同一个 QQ 号</b>会互踢掉线（不同账号一般可共存，但共用 QQNT 数据目录偶尔会干扰登录）。机器人掉线多为 QQ 服务端风控下线（第三方协议登录），程序会自动尝试快速重连恢复。';
+    qqconflict.style.display = '';
+  } else {
+    qqconflict.style.display = 'none';
+  }
+  if (s.log_tail && s.log_tail.length) {
+    $('qq-logtail').innerHTML = '<div class="dim" style="font-size:11px;margin-top:6px">NapCat 输出（最近 12 行）：</div><pre class="mono" style="font-size:11px;max-height:150px;overflow:auto;white-space:pre-wrap">' + esc(s.log_tail.join('\n')) + '</pre>';
+  } else {
+    $('qq-logtail').textContent = '';
+  }
+  // 云端转发链（engine=napcat）：优先显示云端二维码图片，每 25 秒自动刷新
+  try {
+    const rs = await jget('/api/relay/status');
+    if (rs && rs.enabled && (rs.engine || 'napcat') === 'napcat') {
+      if (rs.online) {
+        $('qrbox').textContent = '✓ 云端小号 ' + (rs.qq || '') + ' 已登录在线';
+        if (window._cloudQrTimer) { clearInterval(window._cloudQrTimer); window._cloudQrTimer = null; }
+        // 展示小号加入的群聊列表（反向WS get_group_list）
+        try {
+          const gr = await jget('/api/relay/groups');
+          if (gr && gr.ok && gr.groups && gr.groups.length) {
+            const chips = gr.groups.map(g =>
+              '<span style="display:inline-block;background:var(--panel2,#1d2230);border-radius:12px;'
+              + 'padding:3px 10px;margin:3px 4px 0 0;font-size:12px">'
+              + esc(g.group_name || ('群' + g.group_id)) + ' <span class="dim">' + esc(String(g.group_id)) + '</span></span>');
+            $('qrbox').innerHTML = '✓ 云端小号 ' + esc(rs.qq || '') + ' 已登录在线'
+              + '<div style="margin-top:8px"><div class="dim" style="font-size:12px;margin-bottom:2px">小号加入的群聊（' + gr.groups.length + ' 个）：</div>'
+              + chips.join('') + '</div>'
+              + '<div class="dim" style="font-size:12px;margin-top:8px">转发规则：UPC 群里机器人的推文 → 自动转发到 Monyami 群（1059831074）</div>';
+          }
+        } catch (_e2) { /* 群列表拉取失败不影响在线展示 */ }
+        return;
+      }
+      if (rs.napcat_ready && rs.process === 'running') {
+        $('qrbox').innerHTML = '<img id="cloud-qr" alt="云端二维码" '
+          + 'src="/api/relay/qrcode?t=' + Date.now() + '" '
+          + 'style="width:240px;height:240px;max-width:100%;border-radius:6px;background:#fff;display:block;margin:0 auto">'
+          + '<div class="dim" style="font-size:12px;margin-top:8px;text-align:center">云端小号 '
+          + esc(rs.qq || '') + ' 等待扫码：用手机 QQ 扫上方二维码<br>（每 25 秒自动刷新，过期自动换新）</div>';
+        if (!window._cloudQrTimer) window._cloudQrTimer = setInterval(function () {
+          const im = document.getElementById('cloud-qr');
+          if (im) im.src = '/api/relay/qrcode?t=' + Date.now();
+        }, 25000);
+        return;
+      }
+    }
+  } catch (_e) { /* 云端状态不可得时回退本地逻辑 */ }
+  if (s.qr) $('qrbox').textContent = s.qr;
+  else if (s.status === 'online') $('qrbox').textContent = '✓ 已登录在线，可关闭本页';
+  else if (s.status !== 'wait_qr') $('qrbox').textContent = '（启动后显示二维码字符画，用手机 QQ 扫一扫）';
+}
+async function qqDownload() {
+  const b = $('btn-napcat-dl'); b.disabled = true; b.textContent = '下载中…（可看日志页进度）';
+  $('qq-dl-msg').textContent = '正在下载，可能需要 1-3 分钟（进度见「日志」页）…';
+  try {
+    const r = await fetch('/api/qq/download', {method: 'POST'}).then(r => r.json());
+    if (r.ok) {
+      $('qq-dl-msg').innerHTML = '<span class="okc">✓ NapCat.Shell 安装成功</span>';
+      toast('NapCat 安装完成，可启动并扫码', true);
+    } else {
+      $('qq-dl-msg').innerHTML = '<span style="color:#e06c75">✗ 下载失败：</span>' + esc(r.error || '') +
+        '<div class="dim">提示：可先在「网络」页启动 ChromeGo 内核再重试；或手动下载 Shell zip 解压到程序旁 napcat/ 目录</div>';
+      toast('下载失败，原因已显示在本页', false);
+    }
+  } catch (e) {
+    $('qq-dl-msg').innerHTML = '<span style="color:#e06c75">✗ 请求异常：</span>' + esc(String(e));
+  }
+  b.disabled = false; b.textContent = '下载安装 NapCat.Shell';
+  refreshQQ();
+}
+async function qqStart() {
+  const r = await fetch('/api/qq/start', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({qq: $('in-qq').value.trim()})}).then(r => r.json());
+  if (!r.ok) return toast(r.error, false);
+  if (r.warning) toast(r.warning, false);
+  toast('NapCat 启动中，请等待二维码…'); setTimeout(refreshQQ, 2000);
+}
+async function qqStop() { await fetch('/api/qq/stop', {method: 'POST'}); toast('已停止'); refreshQQ(); }
+
+/* ---------- X 账号 ---------- */
+async function refreshX() {
+  const s = await jget('/api/x/status');
+  $('x-state').innerHTML = s.auth_token_set ? '<span class="okc">✓ 已保存登录凭据</span>' : '<span class="dim">未配置</span>';
+  $('badge-x').textContent = s.auth_token_set ? 'X 已登录' : 'X 未登录';
+  $('badge-x').className = 'badge ' + (s.auth_token_set ? 'on' : 'off');
+}
+async function validateX() {
+  const token = $('in-token').value.trim();
+  if (!token) return toast('请粘贴 auth_token', false);
+  $('x-state').innerHTML = '<span class="dim">验证中…</span>';
+  const r = await fetch('/api/x/validate', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token})}).then(r => r.json());
+  if (r.ok) { toast('X 账号验证成功: @' + r.user); $('x-hint').textContent = '当前登录: @' + r.user; }
+  else { toast(r.error, false); $('x-hint').textContent = '验证失败：' + r.error; }
+  refreshX();
+}
+
+/* ---------- 操作/配置/日志 ---------- */
+async function doCheck() {
+  const btn = $('btn-check'); btn.disabled = true; btn.textContent = '检查中…';
+  try {
+    const r = await fetch('/api/check', {method: 'POST', headers: {'X-Tw2qq-Force': '1'}}).then(r => r.json());
+    if (r.ok) toast(`检查完成：新推送 ${r.sent} 条，出错源 ${r.errors} 个`, r.errors === 0);
+    else toast(r.error || '检查失败', false);
+  } catch (e) { toast('请求失败：' + e, false); }
+  btn.disabled = false; btn.textContent = '立即检查';
+  refreshAll();
+}
+async function togglePolling() {
+  const action = $('btn-toggle').textContent === '暂停轮询' ? 'stop' : 'start';
+  await fetch('/api/polling', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action})});
+  refreshStatus();
+}
+async function toggleAtAll(v) {
+  await fetch('/api/config/quick', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({at_all: v})});
+}
+async function loadAtAll() {
+  try {
+    const c = await jget('/api/config/quick');
+    $('chk-atall').checked = !!c.at_all;
+  } catch (e) {}
+}
+async function loadConfig() {
+  const c = await jget('/api/config');
+  $('cfgbox').value = c.content; $('cfg-msg').textContent = '';
+}
+async function saveConfig() {
+  const r = await fetch('/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({content: $('cfgbox').value})}).then(r => r.json());
+  if (r.ok) { toast('配置已保存并重载'); $('cfg-msg').textContent = '✓ 已保存'; renderGroupChecks(); }
+  else { toast(r.error || '保存失败', false); $('cfg-msg').textContent = r.error || '保存失败'; }
+}
+async function refreshLogs() {
+  const logs = await jget('/api/logs?n=200');
+  const box = $('logbox');
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.textContent = logs.join('\n') || '（暂无日志）';
+  if (nearBottom) box.scrollTop = box.scrollHeight;
+}
+function refreshAll() { refreshStatus(); refreshStats(); refreshHistory(); refreshLogs(); refreshX(); }
+
+/* ---------- 启动 ---------- */
+renderGroupChecks();
+refreshAll();
+loadAtAll();
+setInterval(refreshStatus, 5000);
+setInterval(refreshStats, 30000);
+setInterval(refreshHistory, 10000);
+setInterval(refreshLogs, 3000);
+</script>
+</body>
+</html>

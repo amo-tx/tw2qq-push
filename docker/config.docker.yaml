@@ -1,0 +1,123 @@
+interval_minutes: 10
+poll_seconds: 120
+backfill_hours: 24
+max_push_age_hours: 2
+max_push_per_cycle: 5
+push_guard:
+  enabled: true
+  boot_grace_seconds: 600
+  max_push_age_hours: 2
+  max_push_per_cycle: 5
+  max_push_per_minute: 10
+  replay_cooldown_seconds: 300
+  replay_max: 5
+auto_reconnect: true
+auto_login_qq: true
+send_images: true
+send_videos: true
+max_images: 4
+max_videos: 2
+video_gif_seconds: 10
+translate: true
+db_path: data/seen.db
+network:
+  proxy: ''
+  chromego_kernel: clash.meta
+  chromego_stop_on_exit: false
+  chromego_auto_start: false
+x:
+  auth_token: b2bbe1c620557129431b39954bc13298f36adabe
+twitter:
+  feeds:
+  - name: 潮鳴劇団~ 鳴潮応援部
+    handle: meicyououenbu
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  - name: 낡은창고 oldstore
+    handle: teska1567
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  - name: 手裏剣丸
+    handle: syurikenmaru
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  - name: 모냐미 Monyami
+    handle: monyami_
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  - name: BB
+    handle: BB_33750
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  - name: 아르 Are
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+    handle: Are_A_R
+telegram:
+  enabled: true
+  channels:
+  - name: Seele Leaks（WW）
+    handle: Seele_WW_Leak
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
+  template: '📢 {name} (@{author}) 更新推文
+
+    ⏱ {time}
+
+    ────────────────
+
+    {text}
+
+    ────────────────
+
+    🔗 原文：{link}
+
+    '
+relay:
+  enabled: true
+  engine: napcat
+  qq: '3961685949'
+  webui_token: tw2qq-relay
+  onebot_url: http://127.0.0.1:3001
+  report_url: http://127.0.0.1:5801/onebot/event
+  target_groups:
+  - id: 1059831074
+    feeds:
+    - teska1567
+    - monyami_
+    - bb_33750
+    - syurikenmaru
+    - are_a_r
+  dir: /app/persist/Napcat
+qq:
+  official:
+    enabled: true
+    app_id: '1906300164'
+    client_secret: UVXZcgkpu06DKSbku4FQco1EShwCSj0I
+    collect_groups: true
+    buttons: true
+  napcat:
+    base_url: http://127.0.0.1:3000
+    access_token: ''
+    dir: napcat
+    qq: '3961685949'
+  groups:
+  - CB9118494C282130A1B9FFF0A98AED7D
+template: '🐦 {name} (@{author}) 更新推文
+
+  ⏱ {time}
+
+  ────────────────
+
+  {text}
+
+  ────────────────
+
+  🔗 原文：{link}
+
+  '
+keepalive: {}
+translate_engine: llm
+media_cache_days: 3
+media_cache_max_mb: 500
+at_all: false

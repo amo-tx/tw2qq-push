@@ -1,0 +1,6 @@
+Flask>=3.0.0
+PyYAML>=6.0
+feedparser>=6.0.10
+imageio-ffmpeg>=0.5.1
+requests>=2.31.0
+websocket-client>=1.7

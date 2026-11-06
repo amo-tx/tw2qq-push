@@ -1,0 +1,42 @@
+{
+  "onebot_url": "http://127.0.0.1:3001",
+  "onebot_token": "",
+  "listen_host": "127.0.0.1",
+  "listen_port": 5801,
+  "report_path": "/onebot/event",
+  "target_groups": [
+    {
+      "id": 1059831074,
+      "feeds": ["teska1567", "monyami_", "bb_33750", "syurikenmaru", "are_a_r"]
+    }
+  ],
+  "source_groups": [],
+  "source_qq": [],
+  "source_group_hint": 894183442,
+  "source_qq_hint": 4015477545,
+  "keywords": [
+    "更新推文",
+    "🔗 原文："
+  ],
+  "drop_keywords": [
+    "菜单",
+    "指令面板",
+    "指令速查",
+    "当前状态",
+    "自检报告",
+    "操作成功",
+    "推送已暂停",
+    "推送已恢复",
+    "关注列表",
+    "群指令"
+  ],
+  "bundle_wait_seconds": 10,
+  "bundle_max_seconds": 30,
+  "min_interval_seconds": 3,
+  "max_per_minute": 10,
+  "dedup_minutes": 60,
+  "prefix": "",
+  "split_media_on_fail": true,
+  "db_path": "data/relay.db",
+  "log_path": "logs/relay.log"
+}
