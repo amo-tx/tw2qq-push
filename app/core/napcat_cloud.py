@@ -6,7 +6,8 @@ NapCat（活跃维护、真实 QQNT 协议、风控更低）。参照 NapCat-Ins
 rootless 流程：全部装到 $HOME/Napcat，不碰系统目录。
 
 流程（全部自动）：
-  1. 下载 linuxqq_3.2.34-53644_amd64.deb（腾讯 CDN）→ dpkg -x 到 ~/Napcat/opt/QQ
+  1. 下载 linuxqq_3.2.34-53644_{amd64|arm64}.deb（腾讯 CDN，按 CPU 架构自动选）
+     → dpkg -x 到 ~/Napcat/opt/QQ
      （无 dpkg 时用纯标准库解析 deb：ar 头 + data.tar.xz）
   2. 下载 NapCat.Shell.zip（GitHub，多源+镜像+本机代理）→ 解包到 app_launcher/napcat/
   3. 写 loadNapCat.js、改 package.json main（QQ 启动即加载 NapCat）
@@ -21,6 +22,7 @@ import json
 import logging
 import lzma
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -33,8 +35,13 @@ from urllib.parse import urlparse
 
 LOG = logging.getLogger("napcat-cloud")
 
-QQ_DEB_URL = ("https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/9ee04bef/"
-              "linuxqq_3.2.34-53644_amd64.deb")
+# QQ 官方 CDN 同一目录提供 amd64 / arm64 / loongarch64 包，按宿主 CPU 架构自动选择
+# （Oracle 免费层 A1 机型是 ARM，amd64 包跑不了；arm64 包与 amd64 同版本同结构）
+QQ_DEB_BASE = ("https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/9ee04bef/"
+               "linuxqq_3.2.34-53644")
+QQ_DEB_ARCH = ("arm64" if platform.machine().lower() in ("aarch64", "arm64")
+               else "amd64")
+QQ_DEB_URL = f"{QQ_DEB_BASE}_{QQ_DEB_ARCH}.deb"
 QQ_VERSION = "3.2.34-53644"
 NAPCAT_ZIP_URL = ("https://github.com/NapNeko/NapCatQQ/releases/latest/"
                   "download/NapCat.Shell.zip")
