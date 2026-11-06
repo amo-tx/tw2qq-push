@@ -27,11 +27,17 @@ CLOUD_APP = os.environ.get("TW2QQ_CLOUD_APP",
 SHARECODE = os.environ.get("TW2QQ_SHARECODE", "Z3YR5C5DTB")
 
 
-def wake_cloud() -> dict:
-    """GHA 直连 X 被限流时，唤醒云端应用并让它代跑本轮。
+def wake_cloud(trigger_check: bool = True) -> dict:
+    """唤醒云端应用，必要时让它代跑本轮。
 
-    云端走代理，X 通道正常；访问 /api/health 本身也能唤回被平台回收的 sandbox，
-    因此这一步同时承担「外部看门狗」职责。任何异常只记录、不抛出。
+    WorkBuddy 免费云应用是「按需唤醒」的 sandbox：一旦长时间无外部 HTTP 请求，
+    平台会回收进程，进程内的 self-ping / watchdog 也随之消失。因此**每一轮**
+    GHA 运行都必须先无条件打一次 /api/health（trigger_check=False 时只唤醒），
+    而不只是在自己抓 X 失败时才唤醒 —— 这是当前唯一完全独立于用户电脑和
+    WorkBuddy 桌面客户端的外部心跳源。
+
+    云端走代理，X 通道正常；trigger_check=True 时额外同步触发一轮抓取。
+    任何异常只记录、不抛出。
     """
     import requests
     s = requests.Session()
@@ -49,7 +55,7 @@ def wake_cloud() -> dict:
         except Exception as e:
             logging.warning("云端应用唤醒第 %d 次失败: %s", i + 1, e)
         time.sleep(5)
-    if not out["ok"]:
+    if not out["ok"] or not trigger_check:
         return out
     # 立刻触发一轮抓取以缩短空窗；该接口同步执行，超时不影响判定
     try:
@@ -86,6 +92,12 @@ def build_runtime_config():
 
 
 def main():
+    # 独立于 WorkBuddy 客户端的外部心跳：无论本轮抓 X 是否成功，都先把
+    # 云端 sandbox 唤回在线。冷启动可能需要几十秒，故放在最前面并行预热。
+    import threading
+    threading.Thread(target=lambda: wake_cloud(trigger_check=False),
+                     daemon=True, name="cloud-wake").start()
+
     cfg, run_base = build_runtime_config()
     from core.monitor import Monitor
     from core.cloudstore import CloudStore
@@ -126,11 +138,13 @@ def main():
         if not ok:
             raise RuntimeError("QQ 官方通道不可用: " + str(info))
 
-        # 再写心跳：云端应用据此自动让位，避免这一轮双份推送
+        # 写心跳：云端应用据此在本轮执行期间让位，避免双份推送。
+        # 注意：GHA 是 one-shot，跑完必须立刻释放（见 finally），否则云端
+        # 会因为「15 分钟内 GHA 在线」持续让位，而 GHA 早已退出 → 推送空窗。
         try:
             store.write_heartbeat("gha-" + str(run_id),
                                   {"pushed_total": store.total_seen()})
-            logging.info("GHA 心跳已写入（云端应用将自动让位）")
+            logging.info("GHA 心跳已写入（云端应用本轮让位）")
         except Exception as e:
             logging.warning("GHA 心跳写入失败（不影响本轮推送）: %s", e)
 
@@ -157,6 +171,15 @@ def main():
     except Exception:
         release_cloud()
         raise
+    finally:
+        # 无论成功失败，one-shot 结束后都把主推送权交还云端轮询。
+        # 云端 watchdog 每 30s 巡检，会立即重启 monitor，空窗从 15 分钟降到 30 秒。
+        if not dry:
+            try:
+                store.clear_heartbeat()
+                logging.info("已释放 GHA 心跳，云端应用恢复常驻轮询")
+            except Exception as e:
+                logging.warning("释放 GHA 心跳失败: %s", e)
 
 
 if __name__ == "__main__":
