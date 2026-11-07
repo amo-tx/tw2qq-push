@@ -7,6 +7,7 @@
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -36,6 +37,17 @@ if getattr(sys, "frozen", False):
 else:
     BASE = Path(__file__).parent
     TEMPLATE_DIR = BASE / "templates"
+
+# 时区兜底：云主机/容器默认 UTC 时，控制台与推送文案里的时间会比北京时间慢 8 小时。
+# 优先用 tzdata 的 Asia/Shanghai，没有 zoneinfo 就退回 POSIX 串 CST-8（不依赖任何包）。
+if not os.environ.get("TZ"):
+    os.environ["TZ"] = ("Asia/Shanghai"
+                        if Path("/usr/share/zoneinfo/Asia/Shanghai").exists()
+                        else "CST-8")
+try:
+    time.tzset()
+except (AttributeError, OSError):
+    pass
 
 monitor = Monitor(BASE)
 # 轮询延后到代理内核就绪后再启动（见文件末尾 _boot_sequence）。
@@ -871,6 +883,19 @@ def api_health():
         proxy_ok = bool(chromego.is_running)
     except Exception:
         proxy_ok = None
+    # Linux 云主机上不用 ChromeGo（X 走 WARP/系统代理），只看代理端口是否真能连上，
+    # 否则 health 的 proxy_ok 会一直误报 false。
+    if not proxy_ok:
+        _pxy = str(((monitor.config.get("network") or {}).get("proxy")) or "").strip()
+        if _pxy:
+            try:
+                from urllib.parse import urlparse as _up
+                _u = _up(_pxy)
+                with socket.create_connection(
+                        (_u.hostname or "127.0.0.1", _u.port or 80), timeout=2):
+                    proxy_ok = True
+            except Exception:
+                proxy_ok = False
     age = wd.get("last_check_age")
     gha = wd.get("gha_fresh", False)   # GHA 主推时云端轮询会主动让位
     paused = bool(getattr(monitor, "manual_pause", False))
@@ -1128,18 +1153,43 @@ def api_feeds_backfill():
 
 @app.route("/api/chats")
 def api_chats():
-    """群列表（QQ 实时获取）+ 每个群绑定的博主 + 全局默认群"""
+    """群列表 + 每个群绑定的博主 + 全局默认群
+
+    群列表有两个来源，必须分开判断（曾把两者混在一起导致误报「无法从 QQ 获取群列表」）：
+      1) 官方机器人（开放平台 q.qq.com）：平台没有「拉群列表」的 API，
+         get_group_list 只能返回 WS 收到过群消息后收集到的 group_openid，
+         刚上线 / 群里没人说话时就是空——这不代表机器人离线；
+      2) 小号 OneBot（relay，:3001）：get_group_list 是真实全量群列表。
+    因此「在线」看 get_status()，「群列表」取两者并集，小号群自带真实群名。
+    """
     feeds = iter_feeds(monitor.config)
     feed_list = [{"key": _feed_key(f), "name": f.get("name") or _feed_key(f),
                   "groups": [str(g) for g in (f.get("groups") or [])]}
                  for f in feeds]
     global_groups = [str(g) for g in (monitor.config["qq"].get("groups") or [])]
 
-    bot_error = ""
+    bot_ok, bot_info, bot_error = False, "", ""
     try:
-        gl = monitor.bot.get_group_list()
+        bot_ok, bot_info = monitor.bot.get_status()
     except Exception as e:
-        gl, bot_error = [], f"{type(e).__name__}: {e}"[:180]
+        bot_error = f"{type(e).__name__}: {e}"[:180]
+    try:
+        gl = monitor.bot.get_group_list() or []
+    except Exception as e:
+        gl = []
+        bot_error = bot_error or f"{type(e).__name__}: {e}"[:180]
+
+    # 小号（relay）侧的真实群列表：群号 → 群名，用于命名与「在线」提示
+    relay_groups, rnames = [], {}
+    try:
+        import urllib.request as _ur
+        with _ur.build_opener(_ur.ProxyHandler({})).open(
+                "http://127.0.0.1:5801/groups", timeout=6) as r:
+            relay_groups = json.loads(r.read().decode("utf-8", "replace")).get("groups") or []
+        for g in relay_groups:
+            rnames[str(g.get("group_id"))] = g.get("group_name") or ""
+    except Exception:
+        pass
 
     chats, known = [], set()
     for g in gl:
@@ -1147,18 +1197,20 @@ def api_chats():
         known.add(gid)
         chats.append({
             "id": gid, "name": g.get("group_name") or str(gid),
-            "member_count": g.get("member_count"),
+            "member_count": g.get("member_count"), "official": True,
             "is_global": gid in global_groups,
             "feeds": [{"key": fl["key"], "name": fl["name"]}
                       for fl in feed_list if gid in fl["groups"]],
         })
-    # 配置里有但 QQ 拉不到的群（机器人不在群/未登录）也展示出来，可编辑
+    # 配置里有但官方机器人还没收集到的群（openid 已配置，等价于已在群）也展示出来
     configured = set(global_groups)
     for fl in feed_list:
         configured.update(fl["groups"])
     for gid in sorted(configured - known):
         chats.append({
-            "id": gid, "name": f"群 {gid}（未从 QQ 获取）", "member_count": None,
+            "id": gid,
+            "name": rnames.get(gid) or f"官方机器人推送群（{gid[:8]}…）",
+            "member_count": None, "official": True,
             "is_global": gid in global_groups,
             "feeds": [{"key": fl["key"], "name": fl["name"]}
                       for fl in feed_list if gid in fl["groups"]],
@@ -1166,21 +1218,11 @@ def api_chats():
     # 小号转发目标（relay.json）：同样是可订阅博主的推送目标
     rt = _relay_targets(_relay_cfg())
     if rt:
-        rnames = {}
-        try:
-            import urllib.request as _ur
-            with _ur.build_opener(_ur.ProxyHandler({})).open(
-                    "http://127.0.0.1:5801/groups", timeout=6) as r:
-                for g in (json.loads(r.read().decode("utf-8", "replace"))
-                          .get("groups") or []):
-                    rnames[str(g.get("group_id"))] = g.get("group_name") or ""
-        except Exception:
-            pass
         lower_map = {fl["key"].lower(): fl for fl in feed_list}
         have = {c["id"] for c in chats}
         for t in rt:
             gid = str(t["id"])
-            if gid in have:      # 官方机器人也在该群时避免重复卡片
+            if gid in have:      # 两边都在同一个群时避免重复卡片
                 continue
             fed = []
             for k in t["feeds"]:
@@ -1190,8 +1232,10 @@ def api_chats():
             chats.append({"id": gid, "relay": True,
                           "name": rnames.get(gid) or ("群 %s（小号转发）" % gid),
                           "member_count": None, "is_global": False, "feeds": fed})
-    return jsonify({"ok": True, "bot_online": bool(gl), "error": bot_error,
-                    "chats": chats, "feeds": feed_list})
+    return jsonify({"ok": True, "bot_online": bool(bot_ok), "bot_info": bot_info,
+                    "error": bot_error, "chats": chats, "feeds": feed_list,
+                    "relay_online": bool(rnames),
+                    "relay_group_count": len(relay_groups)})
 
 
 @app.route("/api/chats/bind", methods=["POST"])

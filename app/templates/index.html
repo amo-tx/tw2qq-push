@@ -353,13 +353,15 @@ async function refreshChats() {
   try { s = await jget('/api/chats'); } catch (e) { return; }
   CHATS = s;
   const st = $('chats-state');
-  if (s.error || !s.bot_online) {
-    st.innerHTML = `<span class="err">无法从 QQ 获取群列表${s.error ? '：' + esc(s.error) : ''}</span><br>` +
-      '<span class="dim">请确认「QQ 登录」页状态为在线（顶部 QQ 徽标变绿，即 OneBot :3000 已连通）。</span>';
+  if (!s.bot_online) {
+    st.innerHTML = `<span class="err">QQ 通道未连接${s.error ? '：' + esc(s.error) : ''}</span><br>` +
+      '<span class="dim">官方机器人 WebSocket 未就绪，请到「QQ 登录」页确认状态。</span>';
   } else if (!s.chats.length) {
-    st.innerHTML = '<span class="dim">机器人还没有加入任何群聊——先把机器人 QQ 拉进目标群。</span>';
+    st.innerHTML = '<span class="dim">还没有可推送的群——把小号拉进目标群后刷新，或在下方「小号转发」里添加转发群。</span>';
   } else {
-    st.innerHTML = `<span class="okc">✓ 已连接 QQ，获取到 ${s.chats.length} 个群</span>`;
+    const info = [`✓ QQ 通道在线，共 ${s.chats.length} 个群`];
+    if (s.relay_group_count) info.push(`小号可见 ${s.relay_group_count} 个群`);
+    st.innerHTML = `<span class="okc">${info.join(' · ')}</span>`;
   }
   $('chat-list').innerHTML = s.chats.map(c => {
     const boundKeys = c.feeds.map(f => f.key);
@@ -376,15 +378,16 @@ async function refreshChats() {
         <b>${esc(c.name)}</b>
         <span class="dim mono" style="font-size:12px">${c.id}${c.member_count ? ' · ' + c.member_count + ' 人' : ''}</span>
         ${c.relay ? '<span class="badge on" style="font-size:11px">小号转发</span>' : ''}
+        ${c.official ? '<span class="badge" style="font-size:11px">官方机器人</span>' : ''}
         ${c.is_global ? '<span class="badge on" style="font-size:11px">全局默认</span>' : ''}
         ${c.relay
           ? `<button class="ghost" style="padding:3px 12px;font-size:12px" onclick="relayTarget('remove','${esc(String(c.id))}')">移除转发</button>`
-          : `<button class="ghost" style="padding:3px 12px;font-size:12px" onclick="toggleGlobal(${c.id},${!c.is_global})">${c.is_global ? '取消全局' : '设为全局默认'}</button>`}
+          : `<button class="ghost" style="padding:3px 12px;font-size:12px" onclick="toggleGlobal('${esc(String(c.id))}',${!c.is_global})">${c.is_global ? '取消全局' : '设为全局默认'}</button>`}
       </div>
       <div>${chips || emptyHint}</div>
       ${avail.length ? `<div class="flex" style="margin:10px 0 0">
         <select id="sel-${c.id}" style="min-width:220px">${opts}</select>
-        <button style="padding:6px 14px;font-size:12px" onclick="bindSel(${c.id},${!!c.relay})">＋ 绑定该博主</button>
+        <button style="padding:6px 14px;font-size:12px" onclick="bindSel('${esc(String(c.id))}',${!!c.relay})">＋ 绑定该博主</button>
       </div>` : ''}
     </div>`;
   }).join('');

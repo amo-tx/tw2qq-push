@@ -49,6 +49,16 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 BASE = Path(__file__).resolve().parent
+
+# 时区兜底：容器默认 UTC，转发器日志/去重时间戳都会比北京时间慢 8 小时。
+if not os.environ.get("TZ"):
+    os.environ["TZ"] = ("Asia/Shanghai"
+                        if Path("/usr/share/zoneinfo/Asia/Shanghai").exists()
+                        else "CST-8")
+try:
+    time.tzset()
+except (AttributeError, OSError):
+    pass
 # 掉线恢复需要「来源群 + 机器人 QQ」才能精确补拉历史。转发器进程重启后
 # 内存里的 recent 是空的（恰好也是掉线恢复最常见的时刻），所以把这对信息
 # 落到运行时状态文件；不随部署包发布，sandbox 重启后仍在。
