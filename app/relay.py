@@ -80,8 +80,12 @@ DEFAULT_CONFIG = {
                       "操作成功", "推送已暂停", "推送已恢复", "关注列表", "群指令"],
     "bundle_wait_seconds": 10,               # 文本后等待图片/GIF 到齐的时间
     "bundle_max_seconds": 30,                # 单个 bundle 最长收集时间
-    "min_interval_seconds": 3,               # 每条实际发送之间的最小间隔（防风控）
-    "max_per_minute": 10,
+    "min_interval_seconds": 25,              # 每条实际发送之间的最小间隔（防风控）
+    "min_interval_jitter_seconds": 15,       # 再叠一段随机抖动，避免机械节拍被识别
+    "max_per_minute": 3,                     # 单进程每分钟发送上限
+    "risk_cooldown_minutes": 30,             # 连续撞 sendMsg 风控后进入冷静期
+    "risk_fail_threshold": 2,                # 连续几次「疑似风控」失败触发冷静期
+    "media_mode": "local",                   # 本地媒体传绝对路径；"base64" 可退回旧行为
     "dedup_minutes": 60,
     "prefix": "",                            # 可选转发前缀，如「【转】」
     "split_media_on_fail": True,             # 合并消息发送失败时，退化成逐段发送
@@ -422,19 +426,32 @@ def plain_text(segments: list) -> str:
 MAX_DIRECT_MEDIA_MB = 5      # 与 QQ 官方机器人富媒体上限一致
 
 
-def _file_segment(value, typ: str):
+RISK_ERROR_MARKS = ("1200", "EventChecker Failed", "rich media transfer failed")
+
+
+def _is_risk_error(err) -> bool:
+    """区分「QQ 侧风控/富媒体失败」与「NapCat 没起来」这类普通故障。
+
+    只有前者才该进入冷静期；Connection refused / timeout 说明小号还没登录，
+    冷静 30 分钟反而会把恢复时间拖长。
+    """
+    s = str(err or "")
+    return any(m in s for m in RISK_ERROR_MARKS)
+
+
+def _file_segment(value, typ: str, media_mode: str = "local"):
     """把「本地路径 / http 直链 / base64://」统一成 OneBot 媒体段。
 
-    本地文件优先转 base64：NapCat 跑在容器里、并不走系统代理，X 的图片
-    CDN（pbs.twimg.com）在墙内直连多半拉不到，交给 NapCat 自己下载会失败
-    且失败得很难排查。服务端已经把图落到 data/media/ 了，直接回传字节最稳。
+    本地文件默认传**绝对路径**：NapCat 与服务端在同一容器、同一份文件系统，
+    直接读盘即可，完全不经过网络。旧实现一律转 base64://，体积膨胀 33% 且
+    走富媒体上传通道，大图/GIF 容易触发 `rich media transfer failed`
+    （NapCat 报 retcode 1200），进而把账号临时限制群消息。
+    http 直链仍原样传（NapCat 不走 WARP，X CDN 直连会失败，仅保留兼容）。
     """
     v = str(value or "").strip()
     if not v:
         return None
-    if v.startswith("base64://"):
-        return {"type": typ, "data": {"file": v}}
-    if v.startswith(("http://", "https://")):
+    if v.startswith(("base64://", "http://", "https://", "file://")):
         return {"type": typ, "data": {"file": v}}
     try:
         p = Path(v)
@@ -444,15 +461,40 @@ def _file_segment(value, typ: str):
                 LOG.warning("直投媒体超过 %dMB，跳过: %s (%.1f MB)",
                             MAX_DIRECT_MEDIA_MB, p.name, size / 1048576)
                 return None
-            return {"type": typ,
-                    "data": {"file": "base64://" + base64.b64encode(p.read_bytes()).decode()}}
+            if media_mode == "base64":
+                return {"type": typ,
+                        "data": {"file": "base64://" + base64.b64encode(p.read_bytes()).decode()}}
+            return {"type": typ, "data": {"file": str(p.resolve())}}
         LOG.warning("直投媒体不存在，跳过: %s", v)
     except Exception as e:
         LOG.warning("直投媒体读取失败 %s: %s", v, e)
     return None
 
 
-def build_push_segments(obj: dict) -> list:
+def _base64_fallback(segs: list):
+    """本地路径段发送失败时的兜底：转回 base64（NapCat 版本若不认本地路径）。
+
+    纯文本消息没有本地段，直接返回 None，避免无意义的重试。
+    """
+    out, changed = [], False
+    for s in segs:
+        f = str(s.get("data", {}).get("file", ""))
+        if f and not f.startswith(("http://", "https://", "base64://", "file://")):
+            p = Path(f)
+            if p.is_file():
+                try:
+                    out.append({"type": s["type"],
+                                "data": {"file": "base64://" + base64.b64encode(
+                                    p.read_bytes()).decode()}})
+                    changed = True
+                    continue
+                except Exception as e:
+                    LOG.warning("base64 兜底失败 %s: %s", f, e)
+        out.append(s)
+    return out if changed else None
+
+
+def build_push_segments(obj: dict, media_mode: str = "local") -> list:
     """POST /push 的 body → OneBot 消息段。text → images → videos 顺序发送。
 
     注意类型标记：monitor 传来的 videos 里混有已转好的 **GIF**（官方机器人
@@ -465,12 +507,12 @@ def build_push_segments(obj: dict) -> list:
     if text:
         segs.append({"type": "text", "data": {"text": text}})
     for u in (obj.get("images") or [])[:6]:
-        s = _file_segment(u, "image")
+        s = _file_segment(u, "image", media_mode)
         if s:
             segs.append(s)
     for v in (obj.get("videos") or [])[:3]:
         typ = "image" if str(v).lower().endswith(".gif") else "video"
-        s = _file_segment(v, typ)
+        s = _file_segment(v, typ, media_mode)
         if s:
             segs.append(s)
     return segs
@@ -604,6 +646,13 @@ class Relay:
         self._serve_thread = None
         self._last_send = 0.0
         self._send_times = []
+        # QQ 风控冷静期：连续撞 sendMsg 1200 后不再试发，避免反复撞墙重置
+        # 腾讯侧的冷却计时。期间 /push 快速失败，推文由 monitor 的 6h 待补
+        # 队列兜住，冷静期结束自动补投。
+        self._risk_fails = 0
+        self._risk_until = 0.0
+        self._risk_last_log = 0.0
+        self.last_error = ""
         self.stats = {"received": 0, "matched": 0, "forwarded": 0,
                       "failed": 0, "skipped": 0, "dup": 0, "sent_messages": 0,
                       "direct": 0, "direct_failed": 0}
@@ -817,10 +866,11 @@ class Relay:
     def _throttle(self):
         now = time.time()
         gap = float(self.cfg["min_interval_seconds"])
+        jitter = max(0.0, float(self.cfg.get("min_interval_jitter_seconds", 15)))
         if gap > 0 and self._last_send:
             wait = gap - (now - self._last_send)
             if wait > 0:
-                time.sleep(wait + random.uniform(0, 0.5))
+                time.sleep(wait + random.uniform(0, jitter))
         now = time.time()
         self._send_times = [t for t in self._send_times if now - t < 60]
         limit = int(self.cfg["max_per_minute"])
@@ -832,12 +882,25 @@ class Relay:
         self._send_times.append(self._last_send)
 
     def _send_one(self, gid: int, segments: list) -> bool:
+        # 冷静期内直接快速失败：不要再调用 sendMsg。反复撞 1200 会不断重置
+        # 腾讯侧的临时限制计时，越试越久。日志每 5 分钟最多一条。
+        now0 = time.time()
+        if now0 < self._risk_until:
+            if now0 - self._risk_last_log > 300:
+                LOG.warning("[风控冷静期] 暂停直投，剩余 %.0f 分钟；"
+                            "新推文进入待补队列，冷静期结束后自动补投",
+                            (self._risk_until - now0) / 60)
+                self._risk_last_log = now0
+            self.last_error = "risk cooldown"
+            return False
         payload = {"group_id": gid, "message": segments}
         url = self.cfg["onebot_url"].rstrip("/") + "/send_group_msg"
         err = ""
         for attempt in range(3):
             try:
-                self._throttle()
+                # 节流只针对「新消息」；同一条的内部重试不该再等 25s。
+                if attempt == 0:
+                    self._throttle()
                 r = None
                 if self.ws.connected:
                     # 首选反向 WS（NapCat HTTP 服务端在云端绑不上端口）
@@ -852,6 +915,8 @@ class Relay:
                 if r.get("status") in ("ok", "async") or r.get("retcode") == 0:
                     with self.lock:
                         self.stats["sent_messages"] += 1
+                    self._risk_fails = 0
+                    self.last_error = ""
                     return True
                 err = str(r)[:160]
             except Exception as e:
@@ -859,6 +924,16 @@ class Relay:
             if attempt < 2:
                 LOG.warning("发送失败(第%d次) 群%s: %s", attempt + 1, gid, err)
                 time.sleep(3 * (attempt + 1))
+        self.last_error = err
+        if _is_risk_error(err):
+            self._risk_fails += 1
+            threshold = max(1, int(self.cfg.get("risk_fail_threshold", 2)))
+            if self._risk_fails >= threshold:
+                mins = max(5, int(self.cfg.get("risk_cooldown_minutes", 30)))
+                self._risk_until = time.time() + mins * 60
+                LOG.error("[疑似QQ风控] 连续 %d 次 sendMsg 失败(1200/EventChecker)，"
+                          "进入 %d 分钟冷静期；期间不再试发，推文转待补队列",
+                          self._risk_fails, mins)
         LOG.error("发送失败，已放弃 群%s: %s", gid, err)
         return False
 
@@ -1034,6 +1109,9 @@ class Relay:
                     "source_groups": self.cfg["source_groups"],
                     "source_qq": self.cfg["source_qq"],
                     "config_path": self.cfg.get("_path"),
+                    "risk_cooldown_left": max(0, int(self._risk_until - time.time())),
+                    "risk_fails": self._risk_fails,
+                    "last_error": self.last_error,
                     "stats": dict(self.stats), "queue": self.q.qsize(),
                     "bundle": self.bundles[-1].summary() if self.bundles else None,
                     "bundles": [x.summary() for x in self.bundles],
@@ -1087,7 +1165,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 raw = self._read_body()
                 obj = json.loads(raw.decode("utf-8", "replace")) if raw else {}
-                segs = build_push_segments(obj)
+                segs = build_push_segments(
+                    obj, self.relay.cfg.get("media_mode") or "local")
                 if not segs:
                     self._reply(400, {"ok": False, "error": "内容为空（text/images/videos 都没有）"})
                     return
@@ -1102,10 +1181,23 @@ class Handler(BaseHTTPRequestHandler):
                     self._reply(400, {"ok": False, "error": "没有目标群"})
                     return
                 results, ok_any = {}, False
-                for gid in gids:
-                    ok = self.relay._send_one(gid, segs)
-                    results[str(gid)] = ok
-                    ok_any = ok or ok_any
+                if time.time() < self.relay._risk_until:
+                    # 冷静期：一次 sendMsg 都不发，直接让调用方入待补队列
+                    for gid in gids:
+                        results[str(gid)] = False
+                else:
+                    for gid in gids:
+                        ok = self.relay._send_one(gid, segs)
+                        # 本地路径段失败（且不是 QQ 风控）时退回 base64 再试一次：
+                        # 兼容不认本地路径的 NapCat 版本，风控时绝不加重试。
+                        if (not ok and not _is_risk_error(self.relay.last_error)
+                                and time.time() >= self.relay._risk_until):
+                            alt = _base64_fallback(segs)
+                            if alt:
+                                LOG.warning("本地路径媒体发送失败，改用 base64 兜底重试")
+                                ok = self.relay._send_one(gid, alt)
+                        results[str(gid)] = ok
+                        ok_any = ok or ok_any
                 with self.relay.lock:
                     self.relay.stats["direct" if ok_any else "direct_failed"] += 1
                     self.relay.recent.insert(0, {
@@ -1116,7 +1208,8 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.info("直投%s：%d 段 → 群 %s", "成功" if ok_any else "失败",
                          len(segs), gids)
                 self._reply(200, {"ok": ok_any, "results": results,
-                                  "segments": len(segs)})
+                                  "segments": len(segs),
+                                  "cooldown": max(0, int(self.relay._risk_until - time.time()))})
             except Exception as e:
                 LOG.exception("直投异常: %s", e)
                 self._reply(500, {"ok": False, "error": str(e)[:200]})
