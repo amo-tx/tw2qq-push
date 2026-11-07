@@ -1260,7 +1260,30 @@ def api_chats_bind():
 # ============ QQ 登录通道（NapCat 集成启动器） ============
 @app.route("/api/qq/status")
 def api_qq_status():
-    return jsonify(napcat.status_info())
+    d = napcat.status_info()
+    # Linux/容器里 NapCat 走「反向 WS」模式（relay 监听 5802），并不监听
+    # OneBot HTTP 3000，qq_login 的 30s 心跳探测因此必然失败，会把在线的小号
+    # 报成 offline —— 控制台就会误显示「已掉线·等待重连」，还连带弹出
+    # 「安卓外部模式」的误导提示。这里用真实的反向 WS 连接纠正状态。
+    if d.get("status") != "online":
+        try:
+            need_qr = bool(_relay_manager().status().get("need_qrcode"))
+            fw = {}
+            try:
+                import urllib.request as _ur
+                with _ur.build_opener(_ur.ProxyHandler({})).open(
+                        "http://127.0.0.1:5801/status", timeout=4) as r:
+                    fw = json.loads(r.read().decode("utf-8", "replace"))
+            except Exception:
+                fw = {}
+            if fw.get("ws_connected") and not need_qr:
+                d["status"] = "online"
+                d["status_source"] = "reverse-ws"
+                d["running"] = True
+                d["hint"] = ""
+        except Exception as e:
+            logging.debug("qq status 状态纠正失败: %s", e)
+    return jsonify(d)
 
 
 @app.route("/api/qq/download", methods=["POST"])

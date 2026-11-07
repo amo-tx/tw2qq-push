@@ -89,6 +89,31 @@
   select { background: #0c0e14; border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 7px 10px; font-size: 13px; }
   .flex { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
   a { color: var(--accent); }
+
+  /* ---------- 窄屏（手机 / APK 内嵌 WebView）适配 ----------
+     问题：.grid 子项默认 min-width:auto，里面的 table + select(min-width:220/260px)
+     会把卡片撑到 480px 以上，导致整页横向滚动、右侧图表被裁掉。
+     解法：grid 子项 min-width:0 + 卡片内横向滚动 + 控件可压缩。 */
+  @media (max-width: 640px) {
+    html, body { overflow-x: hidden; }
+    body { padding: 12px 12px; }
+    .grid > *, .row2 > *, .panel, .card { min-width: 0; max-width: 100%; }
+    .panel { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .panel > table, .panel .table-scroll { display: block; overflow-x: auto; }
+    table { font-size: 12px; }
+    th, td { padding: 5px 6px; }
+    select, input[type=text] { min-width: 0 !important; width: 100%; max-width: 100%; }
+    nav { gap: 2px; overflow-x: auto; flex-wrap: nowrap; }
+    nav button { padding: 8px 12px; font-size: 13px; white-space: nowrap; }
+    .bars { gap: 5px; height: 110px; }
+    .bar { min-width: 0; }
+    .bar-date { font-size: 10px; }
+    h1 { font-size: 17px; }
+    .card { padding: 12px 14px; }
+    .card .value { font-size: 20px; }
+    #logbox { height: 240px; }
+    .toast { left: 12px; right: 12px; max-width: none; }
+  }
 </style>
 </head>
 <body>
