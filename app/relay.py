@@ -453,7 +453,13 @@ def _file_segment(value, typ: str):
 
 
 def build_push_segments(obj: dict) -> list:
-    """POST /push 的 body → OneBot 消息段。text → images → videos 顺序发送。"""
+    """POST /push 的 body → OneBot 消息段。text → images → videos 顺序发送。
+
+    注意类型标记：monitor 传来的 videos 里混有已转好的 **GIF**（官方机器人
+    通道是把 GIF 当 image 段发的），GIF 若标成 video 段，NapCat 会把它包装
+    成短视频消息，手机 QQ 解析不了（提示「格式不对」）。按扩展名区分：
+    .gif → image 段（动图），.mp4 等真视频 → video 段。
+    """
     segs = []
     text = str(obj.get("text") or "")
     if text:
@@ -463,7 +469,8 @@ def build_push_segments(obj: dict) -> list:
         if s:
             segs.append(s)
     for v in (obj.get("videos") or [])[:3]:
-        s = _file_segment(v, "video")
+        typ = "image" if str(v).lower().endswith(".gif") else "video"
+        s = _file_segment(v, typ)
         if s:
             segs.append(s)
     return segs
