@@ -1135,7 +1135,9 @@ def api_feeds_backfill():
       * 默认 latest=true，只看最新 1 条——回测是为了验证链路，不是重刷历史；
       * 这条若已在去重库里（官方机器人先推过 / 上一轮已发），直接跳过不重发；
       * 不清空去重记录，不改水位线；
-      * force=true 才允许重发已推过的，且受 PushGuard 冷却与条数上限约束。
+      * force=true 才允许重发已推过的，且受 PushGuard 冷却与条数上限约束；
+      * force 重发已推过的内容时**只补小号直投**，跳过官方群（官方群早发过，
+        双通道一起重发会让群里出现两遍）；only_relay=true 可显式只补直投。
     小号直投通道不依赖官方机器人，所以它在不在线不影响能否回测。
     """
     body = request.get_json(silent=True) or {}
@@ -1153,6 +1155,7 @@ def api_feeds_backfill():
     except (TypeError, ValueError):
         hours = default_hours
     force = bool(body.get("force"))
+    only_relay = bool(body.get("only_relay"))
     latest_only = body.get("latest", True) is not False
     ok, err = False, ""
     try:
@@ -1168,11 +1171,11 @@ def api_feeds_backfill():
         err = "QQ 通道未在线（官方机器人与小号都不可用）"
     if ok:
         threading.Thread(target=monitor.backfill_feed,
-                         args=(feed, hours, force, latest_only),
+                         args=(feed, hours, force, latest_only, only_relay),
                          daemon=True, name="backfill").start()
     return jsonify({"ok": ok, "mode": "replay", "force": force,
                     "latest_only": latest_only, "via_relay": relay_ok,
-                    "hours": hours, "cleared": 0,
+                    "only_relay": only_relay, "hours": hours, "cleared": 0,
                     "error": err if not ok else ""})
 
 

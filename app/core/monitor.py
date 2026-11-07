@@ -449,17 +449,23 @@ class Monitor:
                 items = []
         except Exception:
             items = []
-        items.append({**payload, "tries": 0,
+        items.append({**payload, "tries": 0, "at_ts": time.time(),
                       "at": time.strftime("%Y-%m-%d %H:%M:%S")})
-        items = items[-30:]
+        items = items[-100:]
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
         except Exception as e:
             logging.warning("直投待补队列写入失败: %s", e)
 
-    def flush_relay_pending(self, max_retries: int = 3) -> int:
-        """小号恢复在线后补投掉线期间没发出去的推文；超过重试次数就丢弃。"""
+    def flush_relay_pending(self, max_age_hours: float = 6) -> int:
+        """小号恢复在线后补投掉线期间没发出去的推文。
+
+        按**时间**保留（默认 6 小时），不再按重试次数丢弃：QQ 风控冻结会话后
+        需要人工扫码，常常几十分钟才恢复，旧版重试 3 次（约 3 分钟）就把消息
+        丢了，扫码回来也补不回来。失败按 tries 线性退避（60s→900s），
+        避免风控期间每 60s 刷一次失败日志。
+        """
         p = self._relay_pending_path
         if not p.exists():
             return 0
@@ -469,18 +475,26 @@ class Monitor:
                 return 0
         except Exception:
             return 0
+        now = time.time()
         left, sent = [], 0
         for it in items:
+            at_ts = float(it.get("at_ts") or 0) or now
+            if now - at_ts > max_age_hours * 3600:
+                logging.warning("直投待补过期（%.1f 小时未送达）：%s %s",
+                                (now - at_ts) / 3600, it.get("name"), it.get("id"))
+                continue
+            tries = int(it.get("tries") or 0)
+            # 首次立即重试，之后按 tries 线性退避（60s→900s）
+            if tries:
+                last_try = float(it.get("last_try_ts") or at_ts)
+                if now - last_try < min(60 + 120 * tries, 900):
+                    left.append(it)      # 退避窗口内，本轮不试
+                    continue
             body = {k: it.get(k) for k in ("groups", "text", "images", "videos")}
             if self._post_relay(body):
                 sent += 1
                 continue
-            tries = int(it.get("tries") or 0) + 1
-            if tries < max_retries:
-                left.append({**it, "tries": tries})
-            else:
-                logging.warning("直投待补放弃（重试 %d 次仍失败）：%s %s",
-                                tries, it.get("name"), it.get("id"))
+            left.append({**it, "tries": tries + 1, "last_try_ts": now})
         try:
             p.write_text(json.dumps(left, ensure_ascii=False, indent=1), encoding="utf-8")
         except Exception as e:
@@ -489,8 +503,13 @@ class Monitor:
             logging.info("小号补投：成功 %d 条，剩余待补 %d 条", sent, len(left))
         return sent
 
-    def _push_one(self, url: str, name: str, t: dict, groups: list, feed_cfg: dict = None) -> bool:
-        """格式化并发送一条推文；成功记入已推送和历史。失败返回 False（不记 id，下轮重试）"""
+    def _push_one(self, url: str, name: str, t: dict, groups: list,
+                  feed_cfg: dict = None, skip_official: bool = False) -> bool:
+        """格式化并发送一条推文；成功记入已推送和历史。失败返回 False（不记 id，下轮重试）
+
+        skip_official=True：只走小号直投，跳过官方机器人群。用于「官方群已发过、
+        只补小号群」的补发场景——否则同一条推文会在官方群里出现两遍。
+        """
         ts = t.get("ts") or 0
         tstr = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else ""
         # @全体成员：博主级 at_all 优先，否则用全局开关（需机器人为群管理员）
@@ -529,13 +548,15 @@ class Monitor:
         relay_gids = self._relay_targets(feed_cfg) if feed_cfg is not None else []
         try:
             ok_groups, failed = [], []
-            if groups:
+            if groups and not skip_official:
                 # 与「其它源 / 手动补推」互斥，保证 text → 图片 1..N 连续发完再让位。
                 with self._push_lock:
                     ok_groups, failed = self.bot.send_post(
                         groups, text, images, video_paths, at_all=at_all)
                 for f in failed:
                     logging.warning("[%s] 群 %s 未送达: %s", name, f["group_id"], f["error"])
+            elif skip_official:
+                logging.info("[%s] %s 仅补小号直投（跳过官方群，避免重复推送）", name, t["id"])
             # 小号直投：官方机器人发不发都与它无关，独立成一条通道
             if relay_gids and self._push_relay(name, t, relay_gids, text,
                                                images, video_paths):
@@ -591,7 +612,8 @@ class Monitor:
         return sent
 
     def backfill_feed(self, feed_cfg: dict, hours: int = None,
-                      force: bool = False, latest_only: bool = True) -> int:
+                      force: bool = False, latest_only: bool = True,
+                      only_relay: bool = False) -> int:
         """回测：只取该博主**最新一条**推文试推一次，已推过就不发。
 
         与旧实现的关键区别：
@@ -602,6 +624,9 @@ class Monitor:
         3. 最新一条若已在去重库里（官方机器人先推过 / 上一轮已发），直接跳过，
            不重复发——这正是「回测时官方机器人已发过导致小号收不到」的场景。
         force=True 才允许重发已推过的，且受 PushGuard 冷却与条数上限约束。
+        only_relay=True / force 重发已推过的：只补小号直投，跳过官方机器人群。
+        原因：force 回测的推文几乎必然已在官方群发过，双通道一起重发会让
+        群里出现两遍（13:37 补发就造成过一次），必须只补没送达的那条通道。
         """
         if hours is None:
             hours = int(self.config.get("backfill_hours", 24))
@@ -630,11 +655,17 @@ class Monitor:
                 # 只测最新一条时不受回测时间窗限制：哪怕博主三天没发，也要测那一条
                 hours=(max(int(hours or 0), 24 * 365) if latest_only else hours),
                 force=force)
+            # 先取快照，避免下面 to_mark 把同一批 id 写进去后误判成「已发过」
+            known_before = self.store.known_ids(url) if force else set()
             for t in d.to_mark:
                 self.store.mark(url, t["id"])
             sent = 0
+            # force 重发的是「已推过」的内容：官方群一定发过了，只补小号直投。
+            # 显式 only_relay 同理。全新推文（force 但去重未命中）仍走双通道。
             for t in d.to_push:
-                if self._push_one(url, name, t, groups, feed_cfg):
+                skip_official = only_relay or (force and str(t["id"]) in known_before)
+                if self._push_one(url, name, t, groups, feed_cfg,
+                                  skip_official=skip_official):
                     sent += 1
             if latest_only and not sent:
                 if d.skipped_known:

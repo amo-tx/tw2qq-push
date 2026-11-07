@@ -307,11 +307,12 @@ class OfficialBotClient:
                     {"msg_type": 7, "media": {"file_info": fi}, "msg_seq": 1}))
             except Exception as e:
                 logging.warning("官方通道图片上传失败: %s", e)
-                # 降级：文本里带上图片直链
+                # 降级只发「图片直链」这一条短消息，**不要重复整条推文文本**。
+                # 旧实现把 (text + 直链) 再发一遍，群里会看到两条一模一样的推文。
                 if url.startswith("http") and url not in text:
                     results.append(self._api(
                         "POST", f"/v2/groups/{group_openid}/messages",
-                        {"msg_type": 0, "content": (text + f"\n🖼 {url}")[:2000],
+                        {"msg_type": 0, "content": ("🖼 图片：" + url)[:2000],
                          "msg_seq": 1}))
         return {"status": "ok", "ret": results}
 
