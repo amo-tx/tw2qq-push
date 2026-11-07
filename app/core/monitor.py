@@ -403,6 +403,27 @@ class Monitor:
             for p in (video_paths or []):
                 gif = Path(str(p)).with_suffix(".gif")
                 payload["videos"].append(str(gif if gif.exists() else p))
+            ok = self._post_relay(payload)
+            if ok:
+                logging.info("[%s] 小号直投成功 %s → 群 %s",
+                             name, t.get("id"), gids)
+            else:
+                # 小号掉线时这条会「官方群已发、小号群没发」，而推文已被标记，
+                # 之后回测又会因去重跳过 —— 所以必须进待补队列，等小号恢复再发。
+                payload.update({"name": name, "id": str(t.get("id") or "")})
+                self._relay_pending_add(payload)
+                logging.warning("[%s] 小号直投失败 %s → 群 %s，已加入待补队列",
+                                name, t.get("id"), gids)
+            return ok
+        except Exception as e:
+            logging.error("[%s] 小号直投失败 %s: %s", name, t.get("id"), e)
+            payload.update({"name": name, "id": str(t.get("id") or "")})
+            self._relay_pending_add(payload)
+            return False
+
+    def _post_relay(self, payload: dict) -> bool:
+        """把一段已成形的 payload 交给转发器。"""
+        try:
             req = urllib.request.Request(
                 "http://127.0.0.1:5801/push",
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -410,17 +431,63 @@ class Monitor:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             with opener.open(req, timeout=240) as r:
                 res = json.loads(r.read().decode("utf-8", "replace"))
-            ok = bool(res.get("ok"))
-            if ok:
-                logging.info("[%s] 小号直投成功 %s → 群 %s（%d 段）",
-                             name, t.get("id"), gids, res.get("segments"))
-            else:
-                logging.warning("[%s] 小号直投未送达 %s → 群 %s：%s",
-                                name, t.get("id"), gids, res.get("results"))
-            return ok
+            return bool(res.get("ok"))
         except Exception as e:
-            logging.error("[%s] 小号直投失败 %s: %s", name, t.get("id"), e)
+            logging.warning("直投请求失败: %s", e)
             return False
+
+    # ---------- 直投待补队列（小号掉线兜底） ----------
+    @property
+    def _relay_pending_path(self) -> Path:
+        return self.base_dir / "data" / "relay_pending.json"
+
+    def _relay_pending_add(self, payload: dict) -> None:
+        p = self._relay_pending_path
+        try:
+            items = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+            if not isinstance(items, list):
+                items = []
+        except Exception:
+            items = []
+        items.append({**payload, "tries": 0,
+                      "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+        items = items[-30:]
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception as e:
+            logging.warning("直投待补队列写入失败: %s", e)
+
+    def flush_relay_pending(self, max_retries: int = 3) -> int:
+        """小号恢复在线后补投掉线期间没发出去的推文；超过重试次数就丢弃。"""
+        p = self._relay_pending_path
+        if not p.exists():
+            return 0
+        try:
+            items = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(items, list) or not items:
+                return 0
+        except Exception:
+            return 0
+        left, sent = [], 0
+        for it in items:
+            body = {k: it.get(k) for k in ("groups", "text", "images", "videos")}
+            if self._post_relay(body):
+                sent += 1
+                continue
+            tries = int(it.get("tries") or 0) + 1
+            if tries < max_retries:
+                left.append({**it, "tries": tries})
+            else:
+                logging.warning("直投待补放弃（重试 %d 次仍失败）：%s %s",
+                                tries, it.get("name"), it.get("id"))
+        try:
+            p.write_text(json.dumps(left, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception as e:
+            logging.warning("直投待补队列写回失败: %s", e)
+        if sent or left:
+            logging.info("小号补投：成功 %d 条，剩余待补 %d 条", sent, len(left))
+        return sent
 
     def _push_one(self, url: str, name: str, t: dict, groups: list, feed_cfg: dict = None) -> bool:
         """格式化并发送一条推文；成功记入已推送和历史。失败返回 False（不记 id，下轮重试）"""

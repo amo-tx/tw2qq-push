@@ -471,19 +471,22 @@ def _relay_boot():
 
 
 def _relay_health_tick(state: dict):
-    """每 60s 判定小号转发链是否在线；离线→在线时自动补转漏掉的推文。
+    """每 60s 判定小号转发链是否在线；离线→在线时补发漏掉的内容。
 
-    20:32 事故：小号登录态失效近 50 分钟，期间官方机器人照常推送，但小号
-    收不到群消息，恢复后也不会补发。这里在恢复的那一刻补拉来源群历史，
-    由 relay.py 复用 message_id 去重，只补真正漏掉的推文。
+    直投模式（relay.json direct=true）下没有「来源群监听」，恢复时补的是
+    data/relay_pending.json 里掉线期间没投出去的推文（monitor 在直投失败时
+    入队），而不是去拉群历史（那会把机器人早先发过的重转一遍）。
+    老模式（direct=false）仍走 /recover 补拉来源群历史。
     """
     import urllib.request as _ur
     online = False
+    direct = False
     try:
         with _ur.build_opener(_ur.ProxyHandler({})).open(
                 "http://127.0.0.1:5801/status", timeout=4) as r:
             st = json.loads(r.read().decode("utf-8", "replace"))
         online = bool(st.get("ws_connected"))
+        direct = bool(st.get("direct"))
     except Exception:
         online = False
     # NapCat WebUI 登录态比 WS 更权威：WS 可能仍连着，但小号已掉线等扫码
@@ -501,8 +504,14 @@ def _relay_health_tick(state: dict):
     if not online:
         if prev is not False:
             state["offline_since"] = time.time()
-            logging.warning("[relay] 小号转发链离线，恢复后将自动补转漏掉的推文")
+            logging.warning("[relay] 小号转发链离线，恢复后将自动补发漏掉的推文")
         return
+    # 在线就尝试清一次待补队列（直投失败/掉线期间没发出去的）
+    if direct:
+        try:
+            monitor.flush_relay_pending()
+        except Exception as e:
+            logging.warning("[relay] 待补队列处理失败: %s", e)
     if prev is False and state.get("offline_since"):
         since = state["offline_since"]
         gap = time.time() - since
@@ -510,6 +519,11 @@ def _relay_health_tick(state: dict):
         if gap < 60 or time.time() - state.get("last_recover", 0) < 600:
             return
         state["last_recover"] = time.time()
+        if direct:
+            # 直投模式：内容由服务端投递，没有「来源群消息」可补拉，
+            # 漏掉的推文已在上面用 flush_relay_pending() 补发。
+            logging.warning("[relay] 掉线 %.0f 秒后恢复（直投模式，已补投待补队列）", gap)
+            return
         minutes = max(10, min(240, int(gap / 60) + 10))
         # 只补掉线开始之后的推文，掉线前已转发的绝不重发
         url = ("http://127.0.0.1:5801/recover?minutes=%d&since_ts=%d"
