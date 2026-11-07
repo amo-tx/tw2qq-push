@@ -21,7 +21,11 @@ video_gif_seconds: 10
 translate: true
 db_path: data/seen.db
 network:
-  proxy: ''
+  # Azure/机房 IP 会被 X 403 封禁，必须走 Cloudflare WARP 本地 socks→http 代理
+  # （VM 上 `warp-cli mode proxy` 监听 127.0.0.1:40000）。
+  # 家宽/未被封的环境改成 '' 直连即可。
+  # NO_PROXY 已含 .qq.com，所以 QQ 官方机器人始终直连，不受这里影响。
+  proxy: 'http://127.0.0.1:40000'
   chromego_kernel: clash.meta
   chromego_stop_on_exit: false
   chromego_auto_start: false
