@@ -45,7 +45,7 @@ QQ_DEB_URL = f"{QQ_DEB_BASE}_{QQ_DEB_ARCH}.deb"
 QQ_VERSION = "3.2.34-53644"
 NAPCAT_ZIP_URL = ("https://github.com/NapNeko/NapCatQQ/releases/latest/"
                   "download/NapCat.Shell.zip")
-APT_PKGS = "xvfb xauth libnss3 libgbm1 libasound2"
+APT_PKGS = "xvfb xauth libnss3 libgbm1 libasound2 libgcrypt20"
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
