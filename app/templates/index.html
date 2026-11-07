@@ -403,9 +403,9 @@ async function refreshChats() {
     const tries = rs.auto_recoveries || 0;
     const offlineWarn = on ? '' : `<div style="margin-top:8px;font-size:12px;line-height:1.7">
       ⚠ 云端小号已掉线${offSince ? '（始于 ' + offSince + '）' : ''}${tries ? '，已自动快登重试 ' + tries + ' 次' : ''}。
-      期间机器人推文<b>不会</b>转发到小号群；系统会自动尝试快登，若仍提示验证，请打开
+      期间推文<b>不会</b>投递到小号群（服务端直投，小号不在线就发不出去）；系统会自动尝试快登，若仍提示验证，请打开
       <a href="/relay-qrcode" target="_blank" rel="noopener">QQ 登录页</a> 用手机 QQ 扫码。
-      恢复在线后会<b>自动补转</b>掉线期间漏掉的推文（按消息 ID 去重，不会重复）。</div>`;
+      恢复后可点「回测最新一条」让每个博主的最新推文补投一次。</div>`;
     if (!tg.length && !others.length) {
       rb.innerHTML = `<div class="chat-card"><div class="flex" style="margin-bottom:6px">
         <b>小号转发</b>
@@ -419,7 +419,7 @@ async function refreshChats() {
         <div class="flex" style="margin-bottom:8px">
           <b>小号转发</b>
           <span class="badge ${on ? 'on' : 'off'}">${on ? '✓ 转发链在线' : '× 转发链离线'}</span>
-          <span class="dim" style="font-size:12px">小号把机器人推送群的推文转发到下列「小号转发」群，各群订阅独立</span>
+          <span class="dim" style="font-size:12px">推文由服务端<b>直接投递</b>给小号发送（不再等机器人在群里发一遍），各群订阅独立</span>
         </div>
         ${offlineWarn}
         ${opts ? `<div class="flex" style="margin-top:4px">
@@ -657,18 +657,18 @@ async function refreshManage() {
       <td class="dim mono">${f.source === 'telegram' ? 'TG · ' : '@'}${esc(f.handle || f.url || '')}</td>
       <td class="dim">${f.groups && f.groups.length ? f.groups.join(', ') : '全局'}</td>
       <td>
-        <button onclick="rebackfill('${esc(key).replace(/'/g, '&#39;')}')">↻ 补推漏发</button>
+        <button onclick="rebackfill('${esc(key).replace(/'/g, '&#39;')}')">↻ 回测最新一条</button>
         <button class="danger" onclick="delFeed('${esc(key).replace(/'/g, '&#39;')}')">取关</button>
       </td>
     </tr>`;
   }).join('') || '<tr><td colspan="4" class="dim">暂无关注，去上方添加</td></tr>';
 }
 async function rebackfill(key) {
-  if (!confirm('补推 ' + key + ' 近 24 小时内「漏掉」的推文？\n已推送过的内容不会重发，也不会清空去重记录。')) return;
+  if (!confirm('回测 ' + key + '：只取该博主最近 1 条推文试推一次。\n若这条已经推送过（去重命中），按规则不会重复发送。')) return;
   const r = await fetch('/api/feeds/backfill', {method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({key})}).then(r => r.json());
-  if (r.ok) toast(`正在补推近 ${r.hours || 24} 小时内漏掉的推文（不重发历史）…`, true);
-  else toast(r.error || '补推失败（QQ 未在线？）', false);
+  if (r.ok) toast('正在回测 ' + key + ' 的最新一条推文（已推过则跳过）…', true);
+  else toast(r.error || '回测失败（QQ 通道未在线？）', false);
 }
 async function delFeed(key) {  if (!confirm('确认取关 ' + key + ' ？')) return;
   await fetch('/api/feeds', {method: 'DELETE', headers: {'Content-Type': 'application/json'},

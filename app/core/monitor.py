@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """监控服务：被 main.py（前台运行）和 webui.py（Web 控制台）共用"""
+import json
 import logging
 import re
 import threading
 import time
+import urllib.request
 from collections import deque
 from pathlib import Path
 
@@ -333,6 +335,93 @@ class Monitor:
                         pass
         return paths
 
+    # ---------- 小号直投（不经官方机器人的第二通道） ----------
+    def _relay_conf(self) -> dict:
+        """小号转发配置。运行时订阅（data/relay_targets.json，前端改的就是它）
+        优先于包内 config.yaml —— 重新部署会覆盖 config.yaml，而状态文件不会。"""
+        try:
+            rel = dict(self.config.get("relay") or {})
+        except Exception:
+            rel = {}
+        try:
+            st = self.base_dir / "data" / "relay_targets.json"
+            if st.exists():
+                obj = json.loads(st.read_text(encoding="utf-8"))
+                if obj.get("schema") == 2 and "target_groups" in obj:
+                    rel["target_groups"] = obj["target_groups"]
+        except Exception as e:
+            logging.debug("relay 订阅状态读取失败: %s", e)
+        return rel
+
+    def _relay_targets(self, feed_cfg: dict) -> list:
+        """该博主在小号侧的目标群：relay.target_groups 里 feeds 命中、或 feeds 为空（全收）。"""
+        rel = self._relay_conf()
+        if not rel.get("enabled", True):
+            return []
+        key = clean_handle(feed_cfg.get("handle") or "").lower()
+        if not key:
+            return []
+        out = []
+        for t in (rel.get("target_groups") or []):
+            if not isinstance(t, dict):
+                continue
+            feeds = [str(x).lower() for x in (t.get("feeds") or [])]
+            if feeds and key not in feeds:
+                continue
+            try:
+                out.append(int(t.get("id")))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _push_relay(self, name: str, t: dict, gids: list, text: str,
+                    images: list, video_paths: list) -> bool:
+        """把一条推文直接交给 relay（POST :5801/push），由小号发到目标群。
+
+        与官方机器人通道完全解耦：机器人发过什么、发没发，都不影响这条。
+        媒体先落到本地再传路径——NapCat 不走系统代理，让它自己去拉 pbs.twimg.com
+        在墙内基本必失败，而 relay 与 monitor 在同一容器里，读同一个目录最稳。
+        """
+        payload = {"groups": gids, "text": text, "images": [], "videos": []}
+        try:
+            media_dir = self.base_dir / "data" / "media"
+            media_dir.mkdir(parents=True, exist_ok=True)
+            key = re.sub(r"[^\w-]", "_", str(t.get("id")))[-60:]
+            for i, u in enumerate(images or []):
+                s = str(u)
+                if not s.startswith("http"):
+                    payload["images"].append(s)
+                    continue
+                dest = media_dir / ("relay_%s_%d.jpg" % (key, i))
+                try:
+                    if not dest.exists() or dest.stat().st_size == 0:
+                        download_media(s, dest)
+                    payload["images"].append(str(dest))
+                except Exception as e:
+                    logging.warning("[%s] 直投图片下载失败 %s: %s", name, s[:80], e)
+                    payload["images"].append(s)   # 退化成直链，交给 NapCat 再试一次
+            for p in (video_paths or []):
+                gif = Path(str(p)).with_suffix(".gif")
+                payload["videos"].append(str(gif if gif.exists() else p))
+            req = urllib.request.Request(
+                "http://127.0.0.1:5801/push",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST")
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=240) as r:
+                res = json.loads(r.read().decode("utf-8", "replace"))
+            ok = bool(res.get("ok"))
+            if ok:
+                logging.info("[%s] 小号直投成功 %s → 群 %s（%d 段）",
+                             name, t.get("id"), gids, res.get("segments"))
+            else:
+                logging.warning("[%s] 小号直投未送达 %s → 群 %s：%s",
+                                name, t.get("id"), gids, res.get("results"))
+            return ok
+        except Exception as e:
+            logging.error("[%s] 小号直投失败 %s: %s", name, t.get("id"), e)
+            return False
+
     def _push_one(self, url: str, name: str, t: dict, groups: list, feed_cfg: dict = None) -> bool:
         """格式化并发送一条推文；成功记入已推送和历史。失败返回 False（不记 id，下轮重试）"""
         ts = t.get("ts") or 0
@@ -370,20 +459,28 @@ class Monitor:
                 text = f"🎬 视频/动图直链：{link}\n" + text
                 logging.warning("[%s] %s 的 GIF 生成全部失败，改为附带视频直链",
                                 name, t["id"])
+        relay_gids = self._relay_targets(feed_cfg) if feed_cfg is not None else []
         try:
-            # 与「其它源 / 手动补推」互斥，保证 text → 图片 1..N 连续发完再让位。
-            with self._push_lock:
-                ok_groups, failed = self.bot.send_post(
-                    groups, text, images, video_paths, at_all=at_all)
-            for f in failed:
-                logging.warning("[%s] 群 %s 未送达: %s", name, f["group_id"], f["error"])
+            ok_groups, failed = [], []
+            if groups:
+                # 与「其它源 / 手动补推」互斥，保证 text → 图片 1..N 连续发完再让位。
+                with self._push_lock:
+                    ok_groups, failed = self.bot.send_post(
+                        groups, text, images, video_paths, at_all=at_all)
+                for f in failed:
+                    logging.warning("[%s] 群 %s 未送达: %s", name, f["group_id"], f["error"])
+            # 小号直投：官方机器人发不发都与它无关，独立成一条通道
+            if relay_gids and self._push_relay(name, t, relay_gids, text,
+                                               images, video_paths):
+                ok_groups = list(ok_groups) + list(relay_gids)
             self.store.mark(url, t["id"])
             self.store.record_history(
                 name, t["id"], t["author"], t["text"],
                 ok_groups, len(images) + len(video_paths),
             )
-            logging.info("已推送 [%s] %s -> 群 %s（图%d/视频%d，未送达%d个）",
-                         name, t["id"], ok_groups, len(images), len(video_paths), len(failed))
+            logging.info("已推送 [%s] %s -> 群 %s（图%d/视频%d，未送达%d个，小号直投%s）",
+                         name, t["id"], ok_groups, len(images), len(video_paths), len(failed),
+                         relay_gids or "关")
             return True
         except Exception as e:
             logging.error("推送到 QQ 失败（[%s] %s）: %s", name, t["id"], e)
@@ -411,8 +508,8 @@ class Monitor:
     def _do_process_feed(self, url: str, name: str, tweets: list, feed_cfg: dict) -> int:
         """常规轮询：所有防刷屏判定统一交给 PushGuard，这里只负责落库与发送。"""
         groups = feed_cfg.get("groups") or self.config["qq"]["groups"]  # 博主专属群优先
-        if not groups:
-            logging.warning("[%s] 未配置目标群（博主专属群和全局默认群都为空），本轮只记录不推送", name)
+        if not groups and not self._relay_targets(feed_cfg):
+            logging.warning("[%s] 未配置目标群（官方群和小号转发目标都为空），本轮只记录不推送", name)
             for t in tweets:
                 self.store.mark(url, t["id"])
             return 0
@@ -427,12 +524,16 @@ class Monitor:
         return sent
 
     def backfill_feed(self, feed_cfg: dict, hours: int = None,
-                      force: bool = False) -> int:
-        """回测：补推近 hours 小时内「漏掉」的内容，不破坏去重水位线。
+                      force: bool = False, latest_only: bool = True) -> int:
+        """回测：只取该博主**最新一条**推文试推一次，已推过就不发。
 
-        与旧实现的关键区别：**不再清空去重记录**。旧版调用方先 clear_feed()
-        再回推，等于把水位线抹掉，时间线里更老的内容会在下一轮常规轮询里
-        被重新当成新内容补发 —— 这正是反复刷屏的来源。
+        与旧实现的关键区别：
+        1. 不再清空去重记录。旧版调用方先 clear_feed() 再回推，等于把水位线
+           抹掉，更老的内容会在下一轮常规轮询里被当成新内容补发——正是刷屏来源；
+        2. latest_only=True（默认）只看时间线最新那一条：回测的目的是验证
+           「这条链路现在通不通」，不是把历史重刷一遍；
+        3. 最新一条若已在去重库里（官方机器人先推过 / 上一轮已发），直接跳过，
+           不重复发——这正是「回测时官方机器人已发过导致小号收不到」的场景。
         force=True 才允许重发已推过的，且受 PushGuard 冷却与条数上限约束。
         """
         if hours is None:
@@ -447,18 +548,35 @@ class Monitor:
         try:
             tweets = self._fetch_tweets(feed_cfg)
             groups = feed_cfg.get("groups") or self.config["qq"]["groups"]
-            if not groups:
-                logging.warning("回推 [%s] 跳过：未指定目标群（博主专属群和全局默认群都为空）", name)
+            if not groups and not self._relay_targets(feed_cfg):
+                logging.warning("回推 [%s] 跳过：未指定目标群（官方群和小号转发目标都为空）", name)
                 return 0
-            d = self.guard.select(url, tweets, replay=True, hours=hours, force=force)
+            raw_n = len(tweets)
+            if latest_only and tweets:
+                # 「最新一条」按时间戳取；没有时间戳的源退回时间线首条（X/TG 都是倒序）
+                newest = max(tweets, key=lambda x: (x.get("ts") or 0))
+                if not newest.get("ts"):
+                    newest = tweets[0]
+                tweets = [newest]
+            d = self.guard.select(
+                url, tweets, replay=True,
+                # 只测最新一条时不受回测时间窗限制：哪怕博主三天没发，也要测那一条
+                hours=(max(int(hours or 0), 24 * 365) if latest_only else hours),
+                force=force)
             for t in d.to_mark:
                 self.store.mark(url, t["id"])
             sent = 0
             for t in d.to_push:
                 if self._push_one(url, name, t, groups, feed_cfg):
                     sent += 1
-            logging.info("回推 [%s] 完成：%s；成功推送 %d 条到群 %s",
-                         name, d.reason, sent, groups)
+            if latest_only and not sent:
+                if d.skipped_known:
+                    logging.info("回测 [%s] 最新一条已推送过（去重命中），按规则不重复发送", name)
+                else:
+                    logging.info("回测 [%s] 最新一条未通过闸门：%s", name, d.reason)
+            logging.info("回测 [%s] 完成：时间线 %d 条 → 只测最新 1 条；%s；成功 %d 条到群 %s",
+                         name, raw_n, d.reason, sent,
+                         (groups or []) + self._relay_targets(feed_cfg))
             return sent
         finally:
             with self.lock:

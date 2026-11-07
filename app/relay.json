@@ -4,10 +4,17 @@
   "listen_host": "127.0.0.1",
   "listen_port": 5801,
   "report_path": "/onebot/event",
+  "direct": true,
   "target_groups": [
     {
       "id": 1059831074,
-      "feeds": ["teska1567", "monyami_", "bb_33750", "syurikenmaru", "are_a_r"]
+      "feeds": [
+        "teska1567",
+        "monyami_",
+        "bb_33750",
+        "syurikenmaru",
+        "are_a_r"
+      ]
     }
   ],
   "source_groups": [],

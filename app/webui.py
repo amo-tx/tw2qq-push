@@ -1115,18 +1115,22 @@ def _save_relay_targets(targets: list):
 
 @app.route("/api/feeds/backfill", methods=["POST"])
 def api_feeds_backfill():
-    """回测：补推近 N 小时内「漏掉」的推文。
+    """回测：只取该博主时间线**最新一条**推文试推一次。
 
-    与旧版的区别：**不清空去重记录、不重发已推过的内容**。
-    旧实现 clear_feed() 后重发近 24 小时，抹掉水位线，导致时间线里更老的
-    推文在下一轮轮询被当成新内容补发 —— 反复刷屏的主因之一。
-    force=true 才允许重发已推过的，且受 PushGuard 冷却与条数上限约束。
+    规则（2026-11-07 起）：
+      * 默认 latest=true，只看最新 1 条——回测是为了验证链路，不是重刷历史；
+      * 这条若已在去重库里（官方机器人先推过 / 上一轮已发），直接跳过不重发；
+      * 不清空去重记录，不改水位线；
+      * force=true 才允许重发已推过的，且受 PushGuard 冷却与条数上限约束。
+    小号直投通道不依赖官方机器人，所以它在不在线不影响能否回测。
     """
     body = request.get_json(silent=True) or {}
     key = (body.get("key") or "").strip().lstrip("@")
     feeds = iter_feeds(monitor.config)
+    # 博主 handle 大小写不固定（BB_33750 vs bb_33750），一律不敏感匹配
     feed = next((f for f in feeds
-                 if (f.get("handle") or f.get("url") or "").lstrip("@") == key), None)
+                 if (f.get("handle") or f.get("url") or "").lstrip("@").lower()
+                 == key.lower()), None)
     if not feed:
         return jsonify({"ok": False, "error": f"未找到博主: {key}"}), 400
     default_hours = int(monitor.config.get("backfill_hours", 24))
@@ -1135,18 +1139,25 @@ def api_feeds_backfill():
     except (TypeError, ValueError):
         hours = default_hours
     force = bool(body.get("force"))
+    latest_only = body.get("latest", True) is not False
     ok, err = False, ""
     try:
         ok = monitor.bot.get_status()[0]
-        if not ok:
-            err = "QQ 机器人未在线，无法推送"
     except Exception as e:
         err = str(e)[:150]
+    try:
+        relay_ok = bool(monitor._relay_targets(feed))
+    except Exception:
+        relay_ok = False
+    ok = ok or relay_ok         # 小号直投在线即可回测
+    if not ok and not err:
+        err = "QQ 通道未在线（官方机器人与小号都不可用）"
     if ok:
         threading.Thread(target=monitor.backfill_feed,
-                         args=(feed, hours, force),
+                         args=(feed, hours, force, latest_only),
                          daemon=True, name="backfill").start()
     return jsonify({"ok": ok, "mode": "replay", "force": force,
+                    "latest_only": latest_only, "via_relay": relay_ok,
                     "hours": hours, "cleared": 0,
                     "error": err if not ok else ""})
 

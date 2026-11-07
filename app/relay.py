@@ -70,6 +70,9 @@ DEFAULT_CONFIG = {
     "listen_port": 5801,                     # 避开 console.py 的 5800
     "report_path": "/onebot/event",
     "target_groups": [1059831074],           # 要转发到的群（Monyami 群）
+    # direct=True：内容由服务端 POST /push 直投（推荐，少一层依赖）；
+    # direct=False：老行为，监听 source 群里官方机器人发的消息再转发。
+    "direct": True,
     "source_groups": [],                     # 只监听这些群；空 = 监听所有群
     "source_qq": [],                         # 只转发这些 QQ 发的消息；空 = 靠关键词识别
     "keywords": ["更新推文", "🔗 原文："],
@@ -415,6 +418,57 @@ def plain_text(segments: list) -> str:
                    for s in segments if s.get("type") == "text")
 
 
+# ---------- 直投（服务端 → 转发器 → 群，不经过官方机器人） ----------
+MAX_DIRECT_MEDIA_MB = 5      # 与 QQ 官方机器人富媒体上限一致
+
+
+def _file_segment(value, typ: str):
+    """把「本地路径 / http 直链 / base64://」统一成 OneBot 媒体段。
+
+    本地文件优先转 base64：NapCat 跑在容器里、并不走系统代理，X 的图片
+    CDN（pbs.twimg.com）在墙内直连多半拉不到，交给 NapCat 自己下载会失败
+    且失败得很难排查。服务端已经把图落到 data/media/ 了，直接回传字节最稳。
+    """
+    v = str(value or "").strip()
+    if not v:
+        return None
+    if v.startswith("base64://"):
+        return {"type": typ, "data": {"file": v}}
+    if v.startswith(("http://", "https://")):
+        return {"type": typ, "data": {"file": v}}
+    try:
+        p = Path(v)
+        if p.is_file():
+            size = p.stat().st_size
+            if size > MAX_DIRECT_MEDIA_MB * 1048576:
+                LOG.warning("直投媒体超过 %dMB，跳过: %s (%.1f MB)",
+                            MAX_DIRECT_MEDIA_MB, p.name, size / 1048576)
+                return None
+            return {"type": typ,
+                    "data": {"file": "base64://" + base64.b64encode(p.read_bytes()).decode()}}
+        LOG.warning("直投媒体不存在，跳过: %s", v)
+    except Exception as e:
+        LOG.warning("直投媒体读取失败 %s: %s", v, e)
+    return None
+
+
+def build_push_segments(obj: dict) -> list:
+    """POST /push 的 body → OneBot 消息段。text → images → videos 顺序发送。"""
+    segs = []
+    text = str(obj.get("text") or "")
+    if text:
+        segs.append({"type": "text", "data": {"text": text}})
+    for u in (obj.get("images") or [])[:6]:
+        s = _file_segment(u, "image")
+        if s:
+            segs.append(s)
+    for v in (obj.get("videos") or [])[:3]:
+        s = _file_segment(v, "video")
+        if s:
+            segs.append(s)
+    return segs
+
+
 AUTHOR_RE = re.compile(r"\(@([A-Za-z0-9_]{1,20})\)")
 
 
@@ -544,7 +598,8 @@ class Relay:
         self._last_send = 0.0
         self._send_times = []
         self.stats = {"received": 0, "matched": 0, "forwarded": 0,
-                      "failed": 0, "skipped": 0, "dup": 0, "sent_messages": 0}
+                      "failed": 0, "skipped": 0, "dup": 0, "sent_messages": 0,
+                      "direct": 0, "direct_failed": 0}
         self.recent = []
         self.recent_events = []          # 最近收到的原始事件摘要（排障用）
         self.ws = OneBotWS(cfg.get("ws_host", "127.0.0.1"),
@@ -582,6 +637,10 @@ class Relay:
             except Exception:
                 pass
         if ev.get("post_type") != "message" or ev.get("message_type") != "group":
+            return
+        if self.cfg.get("direct") and not self.probe:
+            # 直投模式：内容由服务端 POST /push 直接送达转发器，不再监听群消息。
+            # 否则「官方机器人发群」+「服务端直投」会把同一条推文发两遍。
             return
         try:
             gid = int(ev.get("group_id") or 0)
@@ -889,6 +948,10 @@ class Relay:
         开始的那一刻」，避免补发掉线前已经转发过的推文。NapCat 不支持该
         扩展动作时返回 ok=False，主链路不受影响（可手工回推补漏）。
         """
+        if self.cfg.get("direct"):
+            # 直投模式没有「来源群监听」，补拉群历史只会在小号恢复时
+            # 把机器人早先发过的推文重转一遍 —— 正是要避免的重复。
+            return {"ok": True, "skipped": "direct 模式不做群历史补拉"}
         if not self.ws.connected:
             return {"ok": False, "error": "反向WS 未连接，稍后重试"}
         gid, uid = self._source_hint()
@@ -954,6 +1017,7 @@ class Relay:
         with self.lock:
             return {"ok": True, "probe": self.probe,
                     "ws_connected": self.ws.connected,
+                    "direct": bool(self.cfg.get("direct")),
                     "onebot_url": self.cfg["onebot_url"],
                     "report": "http://%s:%s%s" % (self.cfg["listen_host"],
                                                   self.cfg["listen_port"],
@@ -1010,6 +1074,46 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/push":
+            # 直投：服务端把推文直接交给转发器，由小号发到目标群。
+            # 不再依赖「官方机器人先发一遍群、小号监听再抄」这条链。
+            try:
+                raw = self._read_body()
+                obj = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+                segs = build_push_segments(obj)
+                if not segs:
+                    self._reply(400, {"ok": False, "error": "内容为空（text/images/videos 都没有）"})
+                    return
+                raw_groups = obj.get("groups") or self.relay.cfg["target_groups"]
+                gids = []
+                for g in raw_groups:
+                    try:
+                        gids.append(int(g))
+                    except (TypeError, ValueError):
+                        continue
+                if not gids:
+                    self._reply(400, {"ok": False, "error": "没有目标群"})
+                    return
+                results, ok_any = {}, False
+                for gid in gids:
+                    ok = self.relay._send_one(gid, segs)
+                    results[str(gid)] = ok
+                    ok_any = ok or ok_any
+                with self.relay.lock:
+                    self.relay.stats["direct" if ok_any else "direct_failed"] += 1
+                    self.relay.recent.insert(0, {
+                        "time": time.strftime("%H:%M:%S"), "group": gids[0],
+                        "user": 0, "segments": len(segs), "ok": ok_any,
+                        "via": "direct"})
+                    del self.relay.recent[20:]
+                LOG.info("直投%s：%d 段 → 群 %s", "成功" if ok_any else "失败",
+                         len(segs), gids)
+                self._reply(200, {"ok": ok_any, "results": results,
+                                  "segments": len(segs)})
+            except Exception as e:
+                LOG.exception("直投异常: %s", e)
+                self._reply(500, {"ok": False, "error": str(e)[:200]})
+            return
         if path == "/targets":
             # 控制台直接下发订阅：两进程若因部署目录/cwd 不同读到了不同的
             # relay.json，靠文件同步永远对不齐；这里以控制台解析结果为准。
@@ -1222,6 +1326,8 @@ def cmd_selftest(args, cfg):
                 "min_interval_seconds": 0, "max_per_minute": 1000,
                 "split_media_on_fail": False, "db_path": ":memory:",
                 "target_groups": [999001],
+                # 自检要覆盖监听/合并/补转这些老路径，直投模式会提前 return
+                "direct": False,
                 # load_config() 会带上真实订阅；自检要覆盖「全部转发」场景
                 "targets": [{"id": 999001, "feeds": []}]})
 
