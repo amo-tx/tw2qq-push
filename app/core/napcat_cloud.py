@@ -72,7 +72,7 @@ class NapCatCloudManager:
         self.auto_recoveries = 0        # 自动快登重启次数
         self.last_recovery_at = 0.0     # 上次自动恢复时间（冷却用）
         self.recovery_cooldown = 600    # 两次自动重启最小间隔（秒）
-        self.max_auto_recoveries = 5    # 每进程最多自动重启次数，防死循环
+        self.max_auto_recoveries = 1000  # 兜底上限（正常账号靠 1h 清零永不触顶；真正死循环靠 600s 冷却限制）
 
     # ---------- 配置 ----------
     @property
@@ -505,13 +505,12 @@ class NapCatCloudManager:
                 p = self.proc
                 if not p or p.poll() is not None:
                     fails += 1
-                    if fails <= 5:
-                        LOG.warning("[napcat] 进程退出（code=%s，第 %d 次），30s 后自动重启",
-                                    p.poll() if p else None, fails)
-                        time.sleep(30)
-                        self.start()
-                    else:
-                        LOG.error("[napcat] 连续退出 %d 次，暂停自动重启（查看 /api/relay/log）", fails)
+                    # 24×7：持续重试，不永久放弃（与登录恢复共用 1000 上限兜底）。
+                    # 真坏状态靠 30s 节奏 + 上层容器 restart=always 收敛，不会空转失控。
+                    LOG.warning("[napcat] 进程退出（code=%s，第 %d 次），30s 后自动重启",
+                                p.poll() if p else None, fails)
+                    time.sleep(30)
+                    self.start()
                     continue
                 fails = 0
                 # 进程活着 ≠ 登录在线。20:32 事故里 NapCat 进程一直 running、
@@ -537,6 +536,14 @@ class NapCatCloudManager:
                                  time.time() - self.offline_since)
                         self.offline_since = 0.0
                     offline_ticks = 0
+                    # 24×7 兜底：稳定在线足够久后清零自动恢复计数。否则小号被反爬
+                    # 反复踢下线累计 5 次后，看门狗会永久停止自愈（容器没崩，
+                    # restart=always 也救不了），长运行必出事。600s 冷却已能防死循环。
+                    if (self.auto_recoveries
+                            and time.time() - self.last_recovery_at > 3600):
+                        LOG.info("[napcat] 已稳定在线 1 小时，清零自动恢复计数（%d→0）",
+                                 self.auto_recoveries)
+                        self.auto_recoveries = 0
                     continue
                 if not self.offline_since:
                     self.offline_since = time.time()
