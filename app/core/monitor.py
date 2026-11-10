@@ -558,9 +558,12 @@ class Monitor:
             elif skip_official:
                 logging.info("[%s] %s 仅补小号直投（跳过官方群，避免重复推送）", name, t["id"])
             # 小号直投：官方机器人发不发都与它无关，独立成一条通道
-            if relay_gids and self._push_relay(name, t, relay_gids, text,
-                                               images, video_paths):
-                ok_groups = list(ok_groups) + list(relay_gids)
+            relay_ok = False
+            if relay_gids:
+                relay_ok = self._push_relay(name, t, relay_gids, text,
+                                            images, video_paths)
+                if relay_ok:
+                    ok_groups = list(ok_groups) + list(relay_gids)
             self.store.mark(url, t["id"])
             self.store.record_history(
                 name, t["id"], t["author"], t["text"],
@@ -569,6 +572,10 @@ class Monitor:
             logging.info("已推送 [%s] %s -> 群 %s（图%d/视频%d，未送达%d个，小号直投%s）",
                          name, t["id"], ok_groups, len(images), len(video_paths), len(failed),
                          relay_gids or "关")
+            # 仅补直投时，官方群没发；直投若失败（已入待补队列）就不能算「成功 1 条」，
+            # 否则回测日志会谎报送达，掩盖风控故障。
+            if skip_official and not relay_ok:
+                return False
             return True
         except Exception as e:
             logging.error("推送到 QQ 失败（[%s] %s）: %s", name, t["id"], e)
@@ -672,9 +679,15 @@ class Monitor:
                     logging.info("回测 [%s] 最新一条已推送过（去重命中），按规则不重复发送", name)
                 else:
                     logging.info("回测 [%s] 最新一条未通过闸门：%s", name, d.reason)
-            logging.info("回测 [%s] 完成：时间线 %d 条 → 只测最新 1 条；%s；成功 %d 条到群 %s",
-                         name, raw_n, d.reason, sent,
-                         (groups or []) + self._relay_targets(feed_cfg))
+            # 只补直投时列官方群会误导（看起来像又发了一遍）；如实标注通道。
+            if only_relay or (force and d.to_push and
+                              all(str(t["id"]) in known_before for t in d.to_push)):
+                targets = "小号直投群 %s（仅补直投，官方群已发过）" % (
+                    self._relay_targets(feed_cfg) or "无")
+            else:
+                targets = str((groups or []) + self._relay_targets(feed_cfg))
+            logging.info("回测 [%s] 完成：时间线 %d 条 → 只测最新 1 条；%s；放行 %d 条，目标 %s",
+                         name, raw_n, d.reason, sent, targets)
             return sent
         finally:
             with self.lock:

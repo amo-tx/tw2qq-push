@@ -493,6 +493,32 @@ class NapCatCloudManager:
         LOG.warning("[napcat] 自动快登重启（原因: %s）", reason or "login-offline")
         return self.start()
 
+    @staticmethod
+    def _reap_zombies(limit: int = 200) -> int:
+        """回收孤儿僵尸子进程。
+
+        容器 PID1 是 webui.py，不是 init，不会自动 wait() 被收养的子进程。
+        NapCat 经 xvfb-run 派生 QQ，崩溃后这些进程被 PID1 收养并长期停在
+        Z 状态；实测累积到 975 个时打满 cgroup pids，触发
+        `pthread_create: Resource temporarily unavailable` 与
+        `RuntimeError: can't start new thread`，控制台、二维码接口、所有
+        HTTP API 一起失效。由 watchdog 每轮代为回收即可根治。
+        副作用：可能抢先回收 Popen 管理的子进程，使其 returncode 记为 0；
+        本项目只用它判断「是否已退出」，不影响行为。
+        """
+        n = 0
+        while n < limit:
+            try:
+                pid, _ = os.waitpid(-1, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                break
+            if not pid:
+                break
+            n += 1
+        if n:
+            LOG.info("[napcat] 已回收 %d 个僵尸子进程", n)
+        return n
+
     def _watchdog(self):
         fails = 0
         offline_ticks = 0
@@ -500,16 +526,20 @@ class NapCatCloudManager:
         while not self._stop.is_set():
             self._stop.wait(30)
             try:
+                self._reap_zombies()
                 if not self.enabled:
                     continue
                 p = self.proc
                 if not p or p.poll() is not None:
                     fails += 1
-                    # 24×7：持续重试，不永久放弃（与登录恢复共用 1000 上限兜底）。
-                    # 真坏状态靠 30s 节奏 + 上层容器 restart=always 收敛，不会空转失控。
-                    LOG.warning("[napcat] 进程退出（code=%s，第 %d 次），30s 后自动重启",
-                                p.poll() if p else None, fails)
-                    time.sleep(30)
+                    # 24×7 兜底保留，但改为指数退避。票据被服务端作废后
+                    # 快速登录必然失败，30s 一轮无限重启既不断向 QQ 服务端
+                    # 发起无效登录（加剧账号级风控），又持续产生僵尸子进程。
+                    # 首次崩溃仍 30s 快速恢复，连续失败逐步拉长到 5 分钟。
+                    wait_s = min(300, 30 * (2 ** min(fails - 1, 4)))
+                    LOG.warning("[napcat] 进程退出（code=%s，第 %d 次），%ds 后自动重启",
+                                p.poll() if p else None, fails, wait_s)
+                    time.sleep(wait_s)
                     self.start()
                     continue
                 fails = 0
@@ -555,6 +585,17 @@ class NapCatCloudManager:
                 if st.get("qrLoginAccepted") or str(st.get("loginPhase") or "") in (
                         "confirm", "qr_scanned", "wait_confirm"):
                     LOG.info("[napcat] 二维码已扫描，等待用户确认，暂不重启")
+                    continue
+                # 票据被服务端作废后 NapCat 会卡在「等待扫码」，此时快速登录必然
+                # 失败（日志：快速登录错误：登录态已失效，请重新登录）。继续按
+                # 冷却反复重启，只会不断向 QQ 服务端发起无效登录尝试，社区实践
+                # 表明这会加剧账号级风控（错误码 168 / 账号安全限制），并让
+                # 「被踢 → 重试 → 更快被踢」形成正反馈。这里保持进程存活、
+                # 二维码继续刷新，等真人扫码后由 login_state 恢复在线即可。
+                phase = str(st.get("loginPhase") or "").lower()
+                if "qr" in phase:
+                    LOG.info("[napcat] 等待人工扫码（phase=%s），跳过自动重启以避免无效登录加剧风控",
+                             st.get("loginPhase"))
                     continue
                 now = time.time()
                 if (offline_ticks >= 3
