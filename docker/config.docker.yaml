@@ -64,6 +64,10 @@ telegram:
     handle: Seele_WW_Leak
     groups:
     - CB9118494C282130A1B9FFF0A98AED7D
+  - name: Team Gemberry78
+    handle: Team_Gemberry78
+    groups:
+    - CB9118494C282130A1B9FFF0A98AED7D
   template: '📢 {name} (@{author}) 更新推文
 
     ⏱ {time}
